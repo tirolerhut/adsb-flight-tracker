@@ -115,15 +115,52 @@ prompt_user "Abfrageintervall in Sekunden [Standard: 5]: " "5" POLL_INTERVAL
 echo -e "${GREEN}[✓]${NC} Abfrageintervall gesetzt auf: ${YELLOW}${POLL_INTERVAL} Sekunden${NC}"
 echo ""
 
-# 5. Python 3 Prüfung & Installation
-echo -e "${BLUE}[1/4]${NC} Prüfe Python 3 Installation..."
-if ! command -v python3 &>/dev/null; then
-  echo -e "${YELLOW}[!] Python 3 nicht gefunden. Installiere über apt...${NC}"
+# 5. Systempakete & Python 3 Abhängigkeiten prüfen & installieren
+echo -e "${BLUE}[1/4]${NC} Prüfe erforderliche Systempakete & Abhängigkeiten..."
+
+REQUIRED_PACKAGES=("python3" "curl" "gawk")
+MISSING_PACKAGES=()
+
+for pkg in "${REQUIRED_PACKAGES[@]}"; do
+  if ! dpkg -s "$pkg" &>/dev/null && ! command -v "$pkg" &>/dev/null; then
+    MISSING_PACKAGES+=("$pkg")
+  fi
+done
+
+if [ ${#MISSING_PACKAGES[@]} -gt 0 ]; then
+  echo -e "${YELLOW}[!] Fehlende Pakete erkannt: ${MISSING_PACKAGES[*]}${NC}"
+  echo -e "${BLUE}[Apt]${NC} Aktualisiere Paketquellen & installiere Abhängigkeiten..."
   apt-get update -y
-  apt-get install -y python3
-else
+  apt-get install -y "${MISSING_PACKAGES[@]}"
+fi
+
+# Detaillierte Paket- & Modulprüfung
+if command -v python3 &>/dev/null; then
   PY_VER=$(python3 --version 2>&1)
-  echo -e "${GREEN}[✓]${NC} $PY_VER ist installiert."
+  echo -e "${GREEN}[✓]${NC} Python: ${YELLOW}$PY_VER${NC}"
+else
+  echo -e "${RED}[FEHLER] Python 3 konnte nicht installiert werden.${NC}"
+  exit 1
+fi
+
+# Prüfe erforderliche Python 3 Standard-Module
+if python3 -c "import urllib.request, urllib.parse, urllib.error, http.server, socketserver, json, csv, argparse, threading, signal, datetime; print('OK')" &>/dev/null; then
+  echo -e "${GREEN}[✓]${NC} Python Standardmodule (urllib, http.server, json, csv, threading): ${YELLOW}Vollständig vorhanden${NC}"
+else
+  echo -e "${YELLOW}[!] Fehlende Python-Module erkannt. Installiere python3-full / standard packages...${NC}"
+  apt-get install -y python3-full python3-pkg-resources || true
+fi
+
+# Prüfe curl
+if command -v curl &>/dev/null; then
+  echo -e "${GREEN}[✓]${NC} HTTP-Client: ${YELLOW}$(curl --version 2>&1 | head -n 1 | cut -d' ' -f1-2)${NC}"
+fi
+
+# Prüfe systemd
+if command -v systemctl &>/dev/null; then
+  echo -e "${GREEN}[✓]${NC} Dienstverwaltung: ${YELLOW}systemd / systemctl bereit${NC}"
+else
+  echo -e "${RED}[WARNUNG] systemctl nicht gefunden. Hintergrunddienst kann evtl. nicht registriert werden.${NC}"
 fi
 
 # 6. Installationsverzeichnisse & Skript anlegen

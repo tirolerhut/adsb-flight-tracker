@@ -357,16 +357,16 @@ export const PythonStudio: React.FC = () => {
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-3 pt-2">
               <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
-                <span className="font-bold text-slate-800 block mb-1">1. Auto-Erkennung</span>
-                <span className="text-slate-500 text-[11px]">Prüft Python 3 und scannt nach der aktiven <code className="text-indigo-600 font-mono">aircraft.json</code> von readsb, dump1090-fa oder tar1090.</span>
+                <span className="font-bold text-slate-800 block mb-1">1. Paket- &amp; Modulprüfung</span>
+                <span className="text-slate-500 text-[11px]">Prüft und installiert automatisch alle Systempakete (<code className="text-indigo-600 font-mono">python3</code>, <code className="text-indigo-600 font-mono">curl</code>, <code className="text-indigo-600 font-mono">gawk</code>) sowie die Python-Standardmodule.</span>
               </div>
               <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
-                <span className="font-bold text-slate-800 block mb-1">2. Ordner &amp; Berechtigungen</span>
-                <span className="text-slate-500 text-[11px]">Legt <code className="text-indigo-600 font-mono">{installDir}</code> sowie den Datenordner für die CSV an und setzt Benutzerrechte.</span>
+                <span className="font-bold text-slate-800 block mb-1">2. Auto-Erkennung &amp; Ordner</span>
+                <span className="text-slate-500 text-[11px]">Scannt nach aktiver <code className="text-indigo-600 font-mono">aircraft.json</code>, legt <code className="text-indigo-600 font-mono">{installDir}</code> &amp; CSV-Ordner an und setzt Benutzerrechte.</span>
               </div>
               <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
                 <span className="font-bold text-slate-800 block mb-1">3. systemd Autostart</span>
-                <span className="text-slate-500 text-[11px]">Erstellt die Service-Unit, aktiviert Autostart bei jedem Pi-Boot und startet den Logger sofort im Hintergrund.</span>
+                <span className="text-slate-500 text-[11px]">Erstellt die Service-Unit, aktiviert Autostart bei jedem Pi-Boot und startet den Logger &amp; Webserver (Port 7001) sofort.</span>
               </div>
             </div>
           </div>
