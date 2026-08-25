@@ -52,8 +52,10 @@ const adsbdbCache = new Map<string, {
 
 /**
  * Fetch flight route, origin, destination and aircraft data from ADSBDB.
- * Primary Endpoint: https://api.adsbdb.com/v0/aircraft/{MODE_S || REGISTRATION}?callsign={CALLSIGN}
- * Fallback Endpoint: https://api.adsbdb.com/v0/callsign/{CALLSIGN}
+ * 1. Primary Endpoint for Origin/Destination/Route via Callsign:
+ *    https://api.adsbdb.com/v0/callsign/{CALLSIGN_ICAO}
+ * 2. Primary Endpoint for Aircraft Model/Type/Registration via Mode-S Hex:
+ *    https://api.adsbdb.com/v0/aircraft/{MODE_S || REGISTRATION}
  */
 export async function fetchAdsbdbRoute(
   callsign?: string,
@@ -72,10 +74,17 @@ export async function fetchAdsbdbRoute(
   const cleanHex = (hex || '').trim().toUpperCase();
   const cleanReg = (registration || '').trim().toUpperCase();
 
+  const hasValidCallsign = Boolean(
+    cleanCs &&
+    cleanCs !== 'NOCALL' &&
+    cleanCs !== 'UNKNOWN' &&
+    cleanCs !== 'UNAVAILABLE' &&
+    cleanCs.length >= 3
+  );
   const ident = cleanHex || cleanReg;
   const cacheKey = `${ident}_${cleanCs}`;
 
-  if (!ident && (!cleanCs || cleanCs === 'NOCALL' || cleanCs === 'UNKNOWN')) {
+  if (!ident && !hasValidCallsign) {
     return null;
   }
 
@@ -92,83 +101,97 @@ export async function fetchAdsbdbRoute(
     };
   }
 
-  try {
-    let url = '';
-    if (ident) {
-      url = `https://api.adsbdb.com/v0/aircraft/${encodeURIComponent(ident)}`;
-      if (cleanCs && cleanCs !== 'NOCALL' && cleanCs !== 'UNKNOWN') {
-        url += `?callsign=${encodeURIComponent(cleanCs)}`;
-      }
-    } else {
-      url = `https://api.adsbdb.com/v0/callsign/${encodeURIComponent(cleanCs)}`;
-    }
+  let origin = '';
+  let destination = '';
+  let airline = '';
+  let route = '';
+  let reg = '';
+  let typeCode = '';
+  let aircraftDesc = '';
 
-    const res = await fetch(url);
-    if (!res.ok) {
-      // If aircraft query failed but we have callsign, try fallback to /callsign
-      if (ident && cleanCs && cleanCs.length >= 3) {
-        const fbRes = await fetch(`https://api.adsbdb.com/v0/callsign/${encodeURIComponent(cleanCs)}`);
-        if (fbRes.ok) {
-          const fbData: AdsbdbResponse = await fbRes.json();
-          const fr = fbData?.response?.flightroute;
+  try {
+    // 1. Primäre Ermittlung von Start & Ziel über das Callsign: /v0/callsign/{CALLSIGN_ICAO}
+    if (hasValidCallsign) {
+      try {
+        const csUrl = `https://api.adsbdb.com/v0/callsign/${encodeURIComponent(cleanCs)}`;
+        const csRes = await fetch(csUrl);
+        if (csRes.ok) {
+          const csData: AdsbdbResponse = await csRes.json();
+          const fr = csData?.response?.flightroute;
           if (fr) {
-            const orig = fr.origin?.iata_code || fr.origin?.icao_code || fr.origin?.municipality || '';
-            const dest = fr.destination?.iata_code || fr.destination?.icao_code || fr.destination?.municipality || '';
-            const airline = fr.airline?.name || '';
-            let routeDesc = '';
-            if (orig && dest) {
-              routeDesc = `${orig} ➔ ${dest}`;
-              if (airline) routeDesc += ` (${airline})`;
+            origin = fr.origin?.iata_code || fr.origin?.icao_code || fr.origin?.municipality || '';
+            destination = fr.destination?.iata_code || fr.destination?.icao_code || fr.destination?.municipality || '';
+            airline = fr.airline?.name || '';
+            if (origin && destination) {
+              route = `${origin} ➔ ${destination}`;
+              if (airline) route += ` (${airline})`;
             } else if (airline) {
-              routeDesc = airline;
+              route = airline;
             }
-            const fbResult = {
-              route: routeDesc,
-              origin: orig,
-              destination: dest,
-              airline
-            };
-            adsbdbCache.set(cacheKey, { ...fbResult, timestamp: Date.now() });
-            return fbResult;
           }
         }
+      } catch (e) {
+        console.debug('Callsign API fetch error:', e);
       }
-      return null;
     }
 
-    const data: AdsbdbResponse = await res.json();
-    const resp = data?.response;
-    if (!resp) return null;
+    // 2. Flugzeug-Stammdaten über Mode-S Hex / Registration: /v0/aircraft/{MODE_S}
+    if (ident) {
+      try {
+        let acUrl = `https://api.adsbdb.com/v0/aircraft/${encodeURIComponent(ident)}`;
+        if (hasValidCallsign && (!origin || !destination)) {
+          acUrl += `?callsign=${encodeURIComponent(cleanCs)}`;
+        }
+        const acRes = await fetch(acUrl);
+        if (acRes.ok) {
+          const acData: AdsbdbResponse = await acRes.json();
+          const ac = acData?.response?.aircraft;
+          const fr = acData?.response?.flightroute;
 
-    const flightroute = resp.flightroute;
-    const aircraft = resp.aircraft;
+          if (ac) {
+            reg = ac.registration || '';
+            typeCode = ac.icao_type || ac.icao_type_code || '';
+            aircraftDesc = ac.type || '';
+            if (!airline && ac.registered_owner) {
+              airline = ac.registered_owner;
+            }
+          }
 
-    const orig = flightroute?.origin?.iata_code || flightroute?.origin?.icao_code || flightroute?.origin?.municipality || '';
-    const dest = flightroute?.destination?.iata_code || flightroute?.destination?.icao_code || flightroute?.destination?.municipality || '';
-    const airline = flightroute?.airline?.name || aircraft?.registered_owner || '';
-
-    let routeDesc = '';
-    if (orig && dest) {
-      routeDesc = `${orig} ➔ ${dest}`;
-      if (airline) routeDesc += ` (${airline})`;
-    } else if (airline) {
-      routeDesc = airline;
+          // Falls Route noch nicht aus dem Callsign-Endpoint ermittelt wurde
+          if ((!origin || !destination) && fr) {
+            const origFallback = fr.origin?.iata_code || fr.origin?.icao_code || fr.origin?.municipality || '';
+            const destFallback = fr.destination?.iata_code || fr.destination?.icao_code || fr.destination?.municipality || '';
+            const airlineFallback = fr.airline?.name || '';
+            if (origFallback && !origin) origin = origFallback;
+            if (destFallback && !destination) destination = destFallback;
+            if (airlineFallback && !airline) airline = airlineFallback;
+            if (origin && destination && !route) {
+              route = `${origin} ➔ ${destination}`;
+              if (airline) route += ` (${airline})`;
+            } else if (airline && !route) {
+              route = airline;
+            }
+          }
+        }
+      } catch (e) {
+        console.debug('Aircraft API fetch error:', e);
+      }
     }
 
     const result = {
-      route: routeDesc,
-      origin: orig,
-      destination: dest,
-      airline: airline,
-      registration: aircraft?.registration,
-      typeCode: aircraft?.icao_type || aircraft?.icao_type_code,
-      aircraftDesc: aircraft?.type
+      route,
+      origin,
+      destination,
+      airline,
+      registration: reg || undefined,
+      typeCode: typeCode || undefined,
+      aircraftDesc: aircraftDesc || undefined
     };
 
     adsbdbCache.set(cacheKey, { ...result, timestamp: Date.now() });
     return result;
   } catch (err) {
-    console.debug('ADSBDB API query skipped/failed:', err);
+    console.debug('ADSBDB API query general failure:', err);
     return null;
   }
 }

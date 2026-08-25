@@ -41,6 +41,10 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from typing import Dict, Any, Optional, Set, List
 
+SCRIPT_VERSION = "2.4.0"
+DEFAULT_GITHUB_REPO = "tirolerhut/adsb-flight-tracker"
+DEFAULT_GITHUB_BRANCH = "main"
+
 # Standard CSV-Spalten
 CSV_FIELDNAMES = [
     "flight_uid", "first_seen_utc", "last_seen_utc", "duration_seconds",
@@ -183,66 +187,36 @@ class ActiveFlight:
 
     def query_adsbdb(self, sync: bool = False, timeout: float = 2.5):
         """
-        Ermittelt Flugdaten (Start, Ziel, Route, Flugzeug-Registrierung, Modell)
-        über die API von adsbdb.com anhand des Mode-S Hex oder der Registration:
-        https://api.adsbdb.com/v0/aircraft/{MODE_S || REGISTRATION}?callsign={CALLSIGN_ICAO}
+        Ermittelt Flugdaten (Start, Ziel, Route, Fluggesellschaft, Flugzeugtyp)
+        mittels der ADSBDB API:
+        1. Primär für Start & Ziel über das ermittelte Rufzeichen:
+           https://api.adsbdb.com/v0/callsign/{CALLSIGN_ICAO}
+        2. Ergänzend für Flugzeugdaten über Mode-S Hex / Registrierung:
+           https://api.adsbdb.com/v0/aircraft/{MODE_S || REGISTRATION}
         """
         if self.adsbdb_queried:
             return
         
-        # Identifikator bestimmen: Mode-S Hex (bevorzugt) oder Registration
+        cs_clean = (self.callsign or "").strip().upper()
         ident = (self.hex or "").strip().upper()
         if not ident and self.registration:
             ident = self.registration.strip().upper()
-        if not ident:
+            
+        has_cs = bool(cs_clean and cs_clean not in ("NOCALL", "UNKNOWN", "NONE") and len(cs_clean) >= 3)
+        
+        if not has_cs and not ident:
             return
 
         self.adsbdb_queried = True
 
         def _do_fetch():
-            try:
-                # 1. Hauptabfrage: /v0/aircraft/{MODE_S || REGISTRATION}?callsign={CALLSIGN}
-                url = f"https://api.adsbdb.com/v0/aircraft/{urllib.parse.quote(ident)}"
-                cs_clean = (self.callsign or "").strip().upper()
-                if self.has_valid_callsign():
-                    url += f"?callsign={urllib.parse.quote(cs_clean)}"
-                
-                req = urllib.request.Request(url, headers={"User-Agent": "ADSB-Logger/1.0 (Raspberry Pi Tracker)"})
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    resp_obj = data.get("response", {})
-                    
-                    # Flugzeug-Stammdaten übernehmen (falls noch leer)
-                    ac_info = resp_obj.get("aircraft", {})
-                    if ac_info:
-                        if not self.registration and ac_info.get("registration"):
-                            self.registration = ac_info.get("registration")
-                        if not self.type_code and ac_info.get("icao_type"):
-                            self.type_code = ac_info.get("icao_type")
-                        if not self.aircraft_desc and ac_info.get("type"):
-                            self.aircraft_desc = ac_info.get("type")
-                        if not self.airline and ac_info.get("registered_owner"):
-                            self.airline = ac_info.get("registered_owner")
-
-                    # Routen- und Flughafendaten übernehmen (Start/Ziel)
-                    fr = resp_obj.get("flightroute", {})
-                    if fr:
-                        orig = fr.get("origin", {}).get("iata_code") or fr.get("origin", {}).get("icao_code") or fr.get("origin", {}).get("municipality") or ""
-                        dest = fr.get("destination", {}).get("iata_code") or fr.get("destination", {}).get("icao_code") or fr.get("destination", {}).get("municipality") or ""
-                        al_name = fr.get("airline", {}).get("name") or ""
-                        if orig: self.origin = orig
-                        if dest: self.destination = dest
-                        if al_name and not self.airline: self.airline = al_name
-                        if orig and dest:
-                            self.route = f"{orig} -> {dest}"
-                            if al_name: self.route += f" ({al_name})"
-                        elif al_name and not self.route:
-                            self.route = al_name
-
-                # 2. Fallback: Falls keine Route geliefert wurde, aber ein Rufzeichen vorliegt: /v0/callsign/{CALLSIGN}
-                if (not self.origin or not self.destination) and self.has_valid_callsign():
+            headers = {"User-Agent": "ADSB-Logger/1.0 (Raspberry Pi Tracker)"}
+            
+            # 1. Ermittlung von Start & Ziel mit der Callsign-API: /v0/callsign/{CALLSIGN_ICAO}
+            if has_cs:
+                try:
                     cs_url = f"https://api.adsbdb.com/v0/callsign/{urllib.parse.quote(cs_clean)}"
-                    cs_req = urllib.request.Request(cs_url, headers={"User-Agent": "ADSB-Logger/1.0 (Raspberry Pi Tracker)"})
+                    cs_req = urllib.request.Request(cs_url, headers=headers)
                     with urllib.request.urlopen(cs_req, timeout=timeout) as cs_resp:
                         cs_data = json.loads(cs_resp.read().decode("utf-8"))
                         cs_fr = cs_data.get("response", {}).get("flightroute", {})
@@ -258,8 +232,49 @@ class ActiveFlight:
                                 if al_name: self.route += f" ({al_name})"
                             elif al_name and not self.route:
                                 self.route = al_name
-            except Exception:
-                pass
+                except Exception:
+                    pass
+
+            # 2. Flugzeug-Stammdaten & Fallback-Route über Mode-S Hex / Registrierung
+            if ident:
+                try:
+                    url = f"https://api.adsbdb.com/v0/aircraft/{urllib.parse.quote(ident)}"
+                    if has_cs and (not self.origin or not self.destination):
+                        url += f"?callsign={urllib.parse.quote(cs_clean)}"
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        resp_obj = data.get("response", {})
+                        
+                        # Flugzeug-Stammdaten übernehmen
+                        ac_info = resp_obj.get("aircraft", {})
+                        if ac_info:
+                            if not self.registration and ac_info.get("registration"):
+                                self.registration = ac_info.get("registration")
+                            if not self.type_code and ac_info.get("icao_type"):
+                                self.type_code = ac_info.get("icao_type")
+                            if not self.aircraft_desc and ac_info.get("type"):
+                                self.aircraft_desc = ac_info.get("type")
+                            if not self.airline and ac_info.get("registered_owner"):
+                                self.airline = ac_info.get("registered_owner")
+
+                        # Falls Start/Ziel noch nicht ermittelt wurden: Fallback aus aircraft response
+                        if not self.origin or not self.destination:
+                            fr = resp_obj.get("flightroute", {})
+                            if fr:
+                                orig = fr.get("origin", {}).get("iata_code") or fr.get("origin", {}).get("icao_code") or fr.get("origin", {}).get("municipality") or ""
+                                dest = fr.get("destination", {}).get("iata_code") or fr.get("destination", {}).get("icao_code") or fr.get("destination", {}).get("municipality") or ""
+                                al_name = fr.get("airline", {}).get("name") or ""
+                                if orig and not self.origin: self.origin = orig
+                                if dest and not self.destination: self.destination = dest
+                                if al_name and not self.airline: self.airline = al_name
+                                if orig and dest and not self.route:
+                                    self.route = f"{orig} -> {dest}"
+                                    if al_name: self.route += f" ({al_name})"
+                                elif al_name and not self.route:
+                                    self.route = al_name
+                except Exception:
+                    pass
 
         if sync:
             _do_fetch()
@@ -396,6 +411,18 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
             self.send_json({"rows": rows, "count": len(rows), "total": len(logger.logged_uids)})
             return
 
+        elif path == "/api/update_check":
+            query = urllib.parse.parse_qs(parsed.query)
+            repo = query.get("repo", [DEFAULT_GITHUB_REPO])[0]
+            branch = query.get("branch", [DEFAULT_GITHUB_BRANCH])[0]
+            raw_url = query.get("raw_url", [""])[0]
+            try:
+                result = logger.check_github_update(repo=repo, branch=branch, raw_url=raw_url)
+                self.send_json(result)
+            except Exception as e:
+                self.send_json({"success": False, "error": f"Fehler bei GitHub Update-Prüfung: {e}"}, status=500)
+            return
+
         else:
             self.send_error(404, "Not Found")
 
@@ -441,6 +468,37 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"success": True, "message": "Logger wurde erfolgreich zurückgesetzt & neu gestartet!"})
             except Exception as e:
                 self.send_json({"success": False, "error": str(e)}, status=500)
+            return
+
+        elif path == "/api/update":
+            try:
+                params = {}
+                if post_data:
+                    try:
+                        params = json.loads(post_data)
+                    except Exception:
+                        form_params = urllib.parse.parse_qs(post_data)
+                        for k, v in form_params.items():
+                            params[k] = v[0]
+                repo = params.get("repo", DEFAULT_GITHUB_REPO)
+                branch = params.get("branch", DEFAULT_GITHUB_BRANCH)
+                raw_url = params.get("raw_url", "")
+                restart = params.get("restart", True)
+                if isinstance(restart, str):
+                    restart = restart.lower() in ("true", "1", "yes")
+
+                result = logger.update_from_github(repo=repo, branch=branch, raw_url=raw_url, restart=restart)
+                self.send_json(result)
+            except Exception as e:
+                self.send_json({"success": False, "error": f"Update-Fehler: {e}"}, status=500)
+            return
+
+        elif path == "/api/rollback":
+            try:
+                result = logger.rollback_backup(restart=True)
+                self.send_json(result)
+            except Exception as e:
+                self.send_json({"success": False, "error": f"Rollback-Fehler: {e}"}, status=500)
             return
 
         else:
@@ -599,14 +657,173 @@ class ADSBLogger:
             self.last_error = err_str
             print(f"\\n[FEHLER] {err_str}", file=sys.stderr, flush=True)
 
+    def get_script_path(self) -> str:
+        try:
+            return os.path.abspath(__file__)
+        except Exception:
+            return os.path.abspath(sys.argv[0])
+
+    def get_backup_path(self) -> str:
+        return self.get_script_path() + ".bak"
+
+    def check_github_update(self, repo: str = DEFAULT_GITHUB_REPO, branch: str = DEFAULT_GITHUB_BRANCH, raw_url: str = "") -> Dict[str, Any]:
+        if not raw_url:
+            repo = (repo or DEFAULT_GITHUB_REPO).strip()
+            branch = (branch or DEFAULT_GITHUB_BRANCH).strip()
+            url = f"https://raw.githubusercontent.com/{repo}/{branch}/adsb_logger.py"
+        else:
+            url = raw_url.strip()
+
+        req = urllib.request.Request(url, headers={"User-Agent": f"ADSB-Logger-Updater/{SCRIPT_VERSION}"})
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            content = resp.read().decode("utf-8")
+
+        remote_ver = "unknown"
+        for line in content.splitlines()[:60]:
+            if line.startswith("SCRIPT_VERSION"):
+                remote_ver = line.split("=")[-1].strip().strip('"').strip("'")
+                break
+
+        script_path = self.get_script_path()
+        local_bytes = os.path.getsize(script_path) if os.path.exists(script_path) else 0
+        has_backup = os.path.exists(self.get_backup_path())
+
+        return {
+            "success": True,
+            "current_version": SCRIPT_VERSION,
+            "remote_version": remote_ver,
+            "up_to_date": remote_ver == SCRIPT_VERSION,
+            "remote_bytes": len(content.encode("utf-8")),
+            "local_bytes": local_bytes,
+            "url": url,
+            "script_path": script_path,
+            "has_backup": has_backup
+        }
+
+    def update_from_github(self, repo: str = DEFAULT_GITHUB_REPO, branch: str = DEFAULT_GITHUB_BRANCH, raw_url: str = "", restart: bool = True) -> Dict[str, Any]:
+        if not raw_url:
+            repo = (repo or DEFAULT_GITHUB_REPO).strip()
+            branch = (branch or DEFAULT_GITHUB_BRANCH).strip()
+            url = f"https://raw.githubusercontent.com/{repo}/{branch}/adsb_logger.py"
+        else:
+            url = raw_url.strip()
+
+        req = urllib.request.Request(url, headers={"User-Agent": f"ADSB-Logger-Updater/{SCRIPT_VERSION}"})
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            new_code = resp.read().decode("utf-8")
+
+        if "class ADSBLogger" not in new_code:
+            raise ValueError("Heruntergeladene Datei ist kein gültiges ADS-B Logger Skript (ADSBLogger Klasse fehlt).")
+
+        # Syntax-Check
+        compile(new_code, "adsb_logger_update.py", "exec")
+
+        script_path = self.get_script_path()
+        backup_path = self.get_backup_path()
+
+        # Backup erstellen
+        if os.path.exists(script_path):
+            try:
+                with open(script_path, "r", encoding="utf-8") as cur_f:
+                    cur_code = cur_f.read()
+                with open(backup_path, "w", encoding="utf-8") as bak_f:
+                    bak_f.write(cur_code)
+            except Exception as e:
+                print(f"[UPDATE WARNUNG] Backup konnte nicht gespeichert werden: {e}")
+
+        # Neue Datei schreiben
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(new_code)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+
+        try:
+            os.chmod(script_path, 0o755)
+        except Exception:
+            pass
+
+        remote_ver = "unknown"
+        for line in new_code.splitlines()[:60]:
+            if line.startswith("SCRIPT_VERSION"):
+                remote_ver = line.split("=")[-1].strip().strip('"').strip("'")
+                break
+
+        print(f"\\n[UPDATE] Skript erfolgreich von {url} aktualisiert! Version: {remote_ver} ({len(new_code)} Bytes)")
+
+        if restart:
+            def _restart_worker():
+                time.sleep(1.2)
+                try:
+                    res = os.system("systemctl restart adsb-logger 2>/dev/null")
+                    if res == 0:
+                        return
+                except Exception:
+                    pass
+                try:
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+                except Exception as e:
+                    print(f"[RESTART FEHLER]: {e}", file=sys.stderr)
+
+            t = threading.Thread(target=_restart_worker, daemon=True)
+            t.start()
+
+        return {
+            "success": True,
+            "message": f"Skript erfolgreich auf Version {remote_ver} aktualisiert! Dienst wird in 1-2 Sekunden neu gestartet.",
+            "version": remote_ver,
+            "script_path": script_path,
+            "backup_path": backup_path,
+            "bytes": len(new_code)
+        }
+
+    def rollback_backup(self, restart: bool = True) -> Dict[str, Any]:
+        script_path = self.get_script_path()
+        backup_path = self.get_backup_path()
+
+        if not os.path.exists(backup_path):
+            raise FileNotFoundError("Keine Backup-Datei (.bak) vorhanden.")
+
+        with open(backup_path, "r", encoding="utf-8") as f:
+            bak_code = f.read()
+
+        compile(bak_code, "adsb_logger_rollback.py", "exec")
+
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(bak_code)
+
+        if restart:
+            def _restart_worker():
+                time.sleep(1.2)
+                try:
+                    os.system("systemctl restart adsb-logger 2>/dev/null")
+                except Exception:
+                    pass
+                try:
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+                except Exception:
+                    pass
+
+            t = threading.Thread(target=_restart_worker, daemon=True)
+            t.start()
+
+        return {
+            "success": True,
+            "message": "Backup (.bak) erfolgreich wiederhergestellt! Dienst startet neu."
+        }
+
     def get_status_dict(self) -> Dict[str, Any]:
         with self.lock:
             uptime = int(time.time() - self.start_time)
             total_active = len(self.active_flights)
             active_with_cs = sum(1 for f in self.active_flights.values() if f.has_valid_callsign())
             csv_size = os.path.getsize(self.csv_path) if os.path.exists(self.csv_path) else 0
+            has_backup = os.path.exists(self.get_backup_path())
             
             return {
+                "version": SCRIPT_VERSION,
                 "status": "running" if self.running else "stopped",
                 "uptime_seconds": uptime,
                 "uptime_formatted": str(datetime.timedelta(seconds=uptime)),
@@ -614,6 +831,8 @@ class ADSBLogger:
                 "interval": self.interval,
                 "timeout_gap": self.timeout_gap,
                 "csv_path": self.csv_path,
+                "script_path": self.get_script_path(),
+                "has_backup": has_backup,
                 "csv_size_bytes": csv_size,
                 "active_aircraft_total": total_active,
                 "active_with_callsign": active_with_cs,
@@ -767,16 +986,16 @@ class ADSBLogger:
       </div>
     </div>
 
-    <!-- Hauptbereich: Einstellungen & CSV Vorschau -->
-    <div class="grid-main">
-      <!-- Formular: Konfiguration & Neustart -->
+    <!-- Hauptbereich: Einstellungen, GitHub Update & CSV Vorschau -->
+    <div class="grid-main" style="grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));">
+      <!-- Formular: Konfiguration & Steuerung -->
       <div class="card">
         <h2 style="font-size: 15px; margin-bottom: 12px; font-weight: 600;">⚙️ Einstellungen & Steuerung</h2>
         <form id="config-form" onsubmit="saveConfig(event)">
           <div class="form-group">
             <label for="cfg-source">ADS-B Quelle (aircraft.json URL oder Pfad)</label>
             <input type="text" id="cfg-source" name="source" placeholder="http://192.168.1.200/data/aircraft.json oder /run/readsb/aircraft.json">
-            <div style="display: flex; gap: 6px; margin-top: 6px;">
+            <div style="display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap;">
               <button type="button" class="btn btn-secondary" style="font-size: 11px; padding: 3px 8px;" onclick="setSource('/run/readsb/aircraft.json')">readsb (Lokal)</button>
               <button type="button" class="btn btn-secondary" style="font-size: 11px; padding: 3px 8px;" onclick="setSource('http://192.168.1.200/data/aircraft.json')">LAN-IP (.200)</button>
             </div>
@@ -787,16 +1006,43 @@ class ADSBLogger:
           </div>
           <div class="btn-group">
             <button type="submit" class="btn btn-primary">💾 Speichern & Anwenden</button>
-            <button type="button" class="btn btn-danger" onclick="restartTracker()">🔄 Logger neu starten</button>
+            <button type="button" class="btn btn-danger" onclick="restartTracker()">🔄 Logger zurücksetzen</button>
           </div>
         </form>
       </div>
 
-      <!-- Quick Info & Pfade -->
+      <!-- GitHub Online-Update -->
+      <div class="card" style="border-color: #3b82f6;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+          <h2 style="font-size: 15px; font-weight: 600; color: #60a5fa;">🐙 GitHub Online-Update</h2>
+          <span class="badge" style="background: rgba(59, 130, 246, 0.15); color: #93c5fd; border-color: rgba(59, 130, 246, 0.3);" id="badge-version">v__VERSION__</span>
+        </div>
+        <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
+          Aktualisiert das Skript direkt über die offizielle GitHub-Seite und startet den Dienst neu.
+        </p>
+        <div class="form-group">
+          <label for="gh-repo">GitHub Repository & Branch</label>
+          <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 8px;">
+            <input type="text" id="gh-repo" value="tirolerhut/adsb-flight-tracker" placeholder="Benutzer/Repo">
+            <input type="text" id="gh-branch" value="main" placeholder="Branch">
+          </div>
+        </div>
+
+        <div id="update-status-box" style="display: none; padding: 10px; border-radius: 8px; font-size: 12px; margin-bottom: 12px; background: #0b1120; border: 1px solid var(--card-border);"></div>
+
+        <div class="btn-group">
+          <button type="button" class="btn btn-secondary" onclick="checkGithubUpdate()" id="btn-check-update">🔍 Nach Update suchen</button>
+          <button type="button" class="btn btn-primary" onclick="runGithubUpdate()" id="btn-run-update" style="background: #2563eb;">🚀 Jetzt aktualisieren</button>
+          <button type="button" class="btn btn-secondary" onclick="rollbackBackup()" id="btn-rollback" style="display: none; color: #fca5a5;">↩️ Rollback (.bak)</button>
+        </div>
+      </div>
+
+      <!-- Quick Info & Dateipfade -->
       <div class="card">
         <h2 style="font-size: 15px; margin-bottom: 12px; font-weight: 600;">📁 Dateipfade & Schnittstellen</h2>
         <div style="font-size: 12px; color: #cbd5e1; display: flex; flex-direction: column; gap: 8px;">
-          <div><strong style="color: #94a3b8;">CSV-Datei:</strong> <code style="color: #67e8f9;" id="info-csv-path">-</code></div>
+          <div><strong style="color: #94a3b8;">Skript:</strong> <code style="color: #93c5fd; word-break: break-all;" id="info-script-path">-</code></div>
+          <div><strong style="color: #94a3b8;">CSV-Datei:</strong> <code style="color: #67e8f9; word-break: break-all;" id="info-csv-path">-</code></div>
           <div><strong style="color: #94a3b8;">REST Status API:</strong> <a href="/api/status" target="_blank" style="color: #60a5fa;">GET /api/status</a></div>
           <div><strong style="color: #94a3b8;">CSV Download:</strong> <a href="/api/csv" style="color: #34d399;">GET /api/csv</a></div>
           <div><strong style="color: #94a3b8;">Vorschau API:</strong> <a href="/api/csv_preview" target="_blank" style="color: #60a5fa;">GET /api/csv_preview</a></div>
@@ -825,8 +1071,9 @@ class ADSBLogger:
               <th>Zeit (UTC)</th>
               <th>Rufzeichen</th>
               <th>Hex</th>
-              <th>Route</th>
-              <th>Airline</th>
+              <th>Start</th>
+              <th>Ziel</th>
+              <th>Route / Airline</th>
               <th>Typ / Reg</th>
               <th>Höhe (Min / Max)</th>
               <th>Max Speed</th>
@@ -835,7 +1082,7 @@ class ADSBLogger:
             </tr>
           </thead>
           <tbody id="csv-tbody">
-            <tr><td colspan="10" style="text-align: center; color: var(--text-muted); padding: 20px;">Lade CSV-Daten...</td></tr>
+            <tr><td colspan="11" style="text-align: center; color: var(--text-muted); padding: 20px;">Lade CSV-Daten...</td></tr>
           </tbody>
         </table>
       </div>
@@ -871,6 +1118,16 @@ class ADSBLogger:
         document.getElementById('stat-source').textContent = data.source;
         document.getElementById('stat-cycle').textContent = 'Letzter Abruf: ' + (data.last_cycle_time || 'Noch keiner');
         document.getElementById('info-csv-path').textContent = data.csv_path;
+        if (data.script_path && document.getElementById('info-script-path')) {
+          document.getElementById('info-script-path').textContent = data.script_path;
+        }
+        if (data.version && document.getElementById('badge-version')) {
+          document.getElementById('badge-version').textContent = 'v' + data.version;
+        }
+        const rollbackBtn = document.getElementById('btn-rollback');
+        if (rollbackBtn) {
+          rollbackBtn.style.display = data.has_backup ? 'inline-flex' : 'none';
+        }
 
         if (!document.getElementById('cfg-source').value) {
           document.getElementById('cfg-source').value = data.source;
@@ -891,6 +1148,107 @@ class ADSBLogger:
       }
     }
 
+    async function checkGithubUpdate() {
+      const repo = document.getElementById('gh-repo').value.trim() || 'tirolerhut/adsb-flight-tracker';
+      const branch = document.getElementById('gh-branch').value.trim() || 'main';
+      const box = document.getElementById('update-status-box');
+      const btn = document.getElementById('btn-check-update');
+      
+      btn.disabled = true;
+      btn.textContent = '⏳ Prüfe GitHub...';
+      box.style.display = 'block';
+      box.innerHTML = '<span style="color: #60a5fa;">Verbinde mit GitHub (' + repo + '@' + branch + ')...</span>';
+
+      try {
+        const res = await fetch('/api/update_check?repo=' + encodeURIComponent(repo) + '&branch=' + encodeURIComponent(branch));
+        const data = await res.json();
+        
+        if (data.success) {
+          if (data.up_to_date) {
+            box.innerHTML = 
+              '<div style="color: #34d399; font-weight: 600; margin-bottom: 4px;">✅ Skript ist auf dem neuesten Stand!</div>' +
+              '<div style="color: #94a3b8;">Installiert: <code>v' + data.current_version + '</code> | GitHub: <code>v' + data.remote_version + '</code> (' + Math.round(data.remote_bytes / 1024) + ' KB)</div>';
+          } else {
+            box.innerHTML = 
+              '<div style="color: #fbbf24; font-weight: 600; margin-bottom: 4px;">🎉 Neues Update auf GitHub verfügbar!</div>' +
+              '<div style="color: #cbd5e1;">Installiert: <code>v' + data.current_version + '</code> ➔ GitHub: <strong style="color:#60a5fa;">v' + data.remote_version + '</strong> (' + Math.round(data.remote_bytes / 1024) + ' KB)</div>' +
+              '<div style="color: #94a3b8; margin-top: 4px; font-size: 11px;">Klicke auf "Jetzt aktualisieren", um die neue Version herunterzuladen.</div>';
+          }
+        } else {
+          box.innerHTML = '<span style="color: #f87171;">⚠️ ' + (data.error || 'Fehler beim Prüfen auf GitHub') + '</span>';
+        }
+      } catch (err) {
+        box.innerHTML = '<span style="color: #f87171;">⚠️ Verbindungsfehler zu GitHub. Bitte Internetverbindung prüfen.</span>';
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '🔍 Nach Update suchen';
+      }
+    }
+
+    async function runGithubUpdate() {
+      const repo = document.getElementById('gh-repo').value.trim() || 'tirolerhut/adsb-flight-tracker';
+      const branch = document.getElementById('gh-branch').value.trim() || 'main';
+      
+      if (!confirm('Möchtest du das ADS-B Logger Skript jetzt direkt von GitHub (' + repo + '@' + branch + ') herunterladen und den Dienst neu starten?')) {
+        return;
+      }
+
+      const box = document.getElementById('update-status-box');
+      const btn = document.getElementById('btn-run-update');
+      
+      btn.disabled = true;
+      btn.textContent = '⏳ Aktualisiere...';
+      box.style.display = 'block';
+      box.innerHTML = '<span style="color: #60a5fa;">🚀 Lade neuestes Skript von GitHub herunter & erstelle Backup...</span>';
+
+      try {
+        const res = await fetch('/api/update', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ repo, branch, restart: true })
+        });
+        const data = await res.json();
+        
+        if (data.success) {
+          showAlert(data.message, true);
+          box.innerHTML = 
+            '<div style="color: #34d399; font-weight: 600;">✅ ' + data.message + '</div>' +
+            '<div style="color: #94a3b8; margin-top: 4px;">Version: <strong>v' + data.version + '</strong> (' + data.bytes + ' Bytes). Die Seite lädt in 4 Sekunden automatisch neu...</div>';
+          setTimeout(() => {
+            window.location.reload();
+          }, 4000);
+        } else {
+          showAlert(data.error || 'Update fehlgeschlagen', false);
+          box.innerHTML = '<span style="color: #f87171;">⚠️ Fehler: ' + (data.error || 'Update fehlgeschlagen') + '</span>';
+          btn.disabled = false;
+          btn.textContent = '🚀 Jetzt aktualisieren';
+        }
+      } catch (err) {
+        showAlert('Update-Befehl gesendet. Dienst startet neu...', true);
+        box.innerHTML = '<span style="color: #34d399;">Dienst startet neu. Seite lädt in 4 Sekunden neu...</span>';
+        setTimeout(() => {
+          window.location.reload();
+        }, 4000);
+      }
+    }
+
+    async function rollbackBackup() {
+      if (!confirm('Möchtest du wirklich die vorherige Skript-Version (.bak) wiederherstellen und neu starten?')) return;
+      try {
+        const res = await fetch('/api/rollback', { method: 'POST' });
+        const data = await res.json();
+        if (data.success) {
+          showAlert(data.message, true);
+          setTimeout(() => { window.location.reload(); }, 3000);
+        } else {
+          showAlert(data.error || 'Rollback fehlgeschlagen', false);
+        }
+      } catch (e) {
+        showAlert('Rollback ausgelöst. Starte neu...', true);
+        setTimeout(() => { window.location.reload(); }, 3000);
+      }
+    }
+
     async function loadPreview() {
       try {
         const res = await fetch('/api/csv_preview?limit=100');
@@ -905,7 +1263,7 @@ class ADSBLogger:
     function renderTable(rows) {
       const tbody = document.getElementById('csv-tbody');
       if (!rows || rows.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="10" style="text-align: center; color: var(--text-muted); padding: 20px;">Noch keine Flüge geloggt.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="11" style="text-align: center; color: var(--text-muted); padding: 20px;">Noch keine Flüge geloggt.</td></tr>';
         return;
       }
       tbody.innerHTML = rows.map(r => 
@@ -913,8 +1271,9 @@ class ADSBLogger:
           '<td style="color: #94a3b8; font-family: monospace;">' + (r.first_seen_utc || '') + '</td>' +
           '<td><strong style="color: #38bdf8;">' + (r.callsign || '<span style="color:#64748b">kein Callsign</span>') + '</strong></td>' +
           '<td><code style="color: #fbbf24;">' + (r.icao_hex || '') + '</code></td>' +
-          '<td style="color: #a7f3d0;">' + (r.route || '-') + '</td>' +
-          '<td>' + (r.airline || '-') + '</td>' +
+          '<td><span style="color: #34d399; font-weight: 600; background: rgba(52, 211, 153, 0.1); padding: 2px 6px; border-radius: 4px;">' + (r.origin || '-') + '</span></td>' +
+          '<td><span style="color: #f472b6; font-weight: 600; background: rgba(244, 114, 182, 0.1); padding: 2px 6px; border-radius: 4px;">' + (r.destination || '-') + '</span></td>' +
+          '<td style="color: #a7f3d0;">' + (r.route || r.airline || '-') + '</td>' +
           '<td>' + (r.type_code || '') + (r.registration ? ' (' + r.registration + ')' : '') + '</td>' +
           '<td>' + (r.altitude_min_ft || '-') + ' / ' + (r.altitude_max_ft || '-') + ' ft</td>' +
           '<td>' + (r.speed_max_kts ? r.speed_max_kts + ' kts' : '-') + '</td>' +
@@ -933,6 +1292,8 @@ class ADSBLogger:
       const filtered = rawRows.filter(r => 
         (r.callsign && r.callsign.toLowerCase().includes(q)) ||
         (r.icao_hex && r.icao_hex.toLowerCase().includes(q)) ||
+        (r.origin && r.origin.toLowerCase().includes(q)) ||
+        (r.destination && r.destination.toLowerCase().includes(q)) ||
         (r.route && r.route.toLowerCase().includes(q)) ||
         (r.airline && r.airline.toLowerCase().includes(q)) ||
         (r.registration && r.registration.toLowerCase().includes(q))
@@ -983,7 +1344,7 @@ class ADSBLogger:
 </body>
 </html>
 """
-        return html.replace("__WEB_PORT__", str(self.web_port))
+        return html.replace("__WEB_PORT__", str(self.web_port)).replace("__VERSION__", SCRIPT_VERSION)
 
     def run(self):
         def _sig_handler(sig, frame):

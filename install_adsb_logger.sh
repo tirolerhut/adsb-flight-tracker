@@ -384,66 +384,36 @@ class ActiveFlight:
 
     def query_adsbdb(self, sync: bool = False, timeout: float = 2.5):
         """
-        Ermittelt Flugdaten (Start, Ziel, Route, Flugzeug-Registrierung, Modell)
-        über die API von adsbdb.com anhand des Mode-S Hex oder der Registration:
-        https://api.adsbdb.com/v0/aircraft/{MODE_S || REGISTRATION}?callsign={CALLSIGN_ICAO}
+        Ermittelt Flugdaten (Start, Ziel, Route, Fluggesellschaft, Flugzeugtyp)
+        mittels der ADSBDB API:
+        1. Primär für Start & Ziel über das ermittelte Rufzeichen:
+           https://api.adsbdb.com/v0/callsign/{CALLSIGN_ICAO}
+        2. Ergänzend für Flugzeugdaten über Mode-S Hex / Registrierung:
+           https://api.adsbdb.com/v0/aircraft/{MODE_S || REGISTRATION}
         """
         if self.adsbdb_queried:
             return
         
-        # Identifikator bestimmen: Mode-S Hex (bevorzugt) oder Registration
+        cs_clean = (self.callsign or "").strip().upper()
         ident = (self.hex or "").strip().upper()
         if not ident and self.registration:
             ident = self.registration.strip().upper()
-        if not ident:
+            
+        has_cs = bool(cs_clean and cs_clean not in ("NOCALL", "UNKNOWN", "NONE") and len(cs_clean) >= 3)
+        
+        if not has_cs and not ident:
             return
 
         self.adsbdb_queried = True
 
         def _do_fetch():
-            try:
-                # 1. Hauptabfrage: /v0/aircraft/{MODE_S || REGISTRATION}?callsign={CALLSIGN}
-                url = f"https://api.adsbdb.com/v0/aircraft/{urllib.parse.quote(ident)}"
-                cs_clean = (self.callsign or "").strip().upper()
-                if self.has_valid_callsign():
-                    url += f"?callsign={urllib.parse.quote(cs_clean)}"
-                
-                req = urllib.request.Request(url, headers={"User-Agent": "ADSB-Logger/1.0 (Raspberry Pi Tracker)"})
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    resp_obj = data.get("response", {})
-                    
-                    # Flugzeug-Stammdaten übernehmen (falls noch leer)
-                    ac_info = resp_obj.get("aircraft", {})
-                    if ac_info:
-                        if not self.registration and ac_info.get("registration"):
-                            self.registration = ac_info.get("registration")
-                        if not self.type_code and ac_info.get("icao_type"):
-                            self.type_code = ac_info.get("icao_type")
-                        if not self.aircraft_desc and ac_info.get("type"):
-                            self.aircraft_desc = ac_info.get("type")
-                        if not self.airline and ac_info.get("registered_owner"):
-                            self.airline = ac_info.get("registered_owner")
-
-                    # Routen- und Flughafendaten übernehmen (Start/Ziel)
-                    fr = resp_obj.get("flightroute", {})
-                    if fr:
-                        orig = fr.get("origin", {}).get("iata_code") or fr.get("origin", {}).get("icao_code") or fr.get("origin", {}).get("municipality") or ""
-                        dest = fr.get("destination", {}).get("iata_code") or fr.get("destination", {}).get("icao_code") or fr.get("destination", {}).get("municipality") or ""
-                        al_name = fr.get("airline", {}).get("name") or ""
-                        if orig: self.origin = orig
-                        if dest: self.destination = dest
-                        if al_name and not self.airline: self.airline = al_name
-                        if orig and dest:
-                            self.route = f"{orig} -> {dest}"
-                            if al_name: self.route += f" ({al_name})"
-                        elif al_name and not self.route:
-                            self.route = al_name
-
-                # 2. Fallback: Falls keine Route geliefert wurde, aber ein Rufzeichen vorliegt: /v0/callsign/{CALLSIGN}
-                if (not self.origin or not self.destination) and self.has_valid_callsign():
+            headers = {"User-Agent": "ADSB-Logger/1.0 (Raspberry Pi Tracker)"}
+            
+            # 1. Ermittlung von Start & Ziel mit der Callsign-API: /v0/callsign/{CALLSIGN_ICAO}
+            if has_cs:
+                try:
                     cs_url = f"https://api.adsbdb.com/v0/callsign/{urllib.parse.quote(cs_clean)}"
-                    cs_req = urllib.request.Request(cs_url, headers={"User-Agent": "ADSB-Logger/1.0 (Raspberry Pi Tracker)"})
+                    cs_req = urllib.request.Request(cs_url, headers=headers)
                     with urllib.request.urlopen(cs_req, timeout=timeout) as cs_resp:
                         cs_data = json.loads(cs_resp.read().decode("utf-8"))
                         cs_fr = cs_data.get("response", {}).get("flightroute", {})
@@ -459,8 +429,49 @@ class ActiveFlight:
                                 if al_name: self.route += f" ({al_name})"
                             elif al_name and not self.route:
                                 self.route = al_name
-            except Exception:
-                pass
+                except Exception:
+                    pass
+
+            # 2. Flugzeug-Stammdaten & Fallback-Route über Mode-S Hex / Registrierung
+            if ident:
+                try:
+                    url = f"https://api.adsbdb.com/v0/aircraft/{urllib.parse.quote(ident)}"
+                    if has_cs and (not self.origin or not self.destination):
+                        url += f"?callsign={urllib.parse.quote(cs_clean)}"
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        resp_obj = data.get("response", {})
+                        
+                        # Flugzeug-Stammdaten übernehmen
+                        ac_info = resp_obj.get("aircraft", {})
+                        if ac_info:
+                            if not self.registration and ac_info.get("registration"):
+                                self.registration = ac_info.get("registration")
+                            if not self.type_code and ac_info.get("icao_type"):
+                                self.type_code = ac_info.get("icao_type")
+                            if not self.aircraft_desc and ac_info.get("type"):
+                                self.aircraft_desc = ac_info.get("type")
+                            if not self.airline and ac_info.get("registered_owner"):
+                                self.airline = ac_info.get("registered_owner")
+
+                        # Falls Start/Ziel noch nicht ermittelt wurden: Fallback aus aircraft response
+                        if not self.origin or not self.destination:
+                            fr = resp_obj.get("flightroute", {})
+                            if fr:
+                                orig = fr.get("origin", {}).get("iata_code") or fr.get("origin", {}).get("icao_code") or fr.get("origin", {}).get("municipality") or ""
+                                dest = fr.get("destination", {}).get("iata_code") or fr.get("destination", {}).get("icao_code") or fr.get("destination", {}).get("municipality") or ""
+                                al_name = fr.get("airline", {}).get("name") or ""
+                                if orig and not self.origin: self.origin = orig
+                                if dest and not self.destination: self.destination = dest
+                                if al_name and not self.airline: self.airline = al_name
+                                if orig and dest and not self.route:
+                                    self.route = f"{orig} -> {dest}"
+                                    if al_name: self.route += f" ({al_name})"
+                                elif al_name and not self.route:
+                                    self.route = al_name
+                except Exception:
+                    pass
 
         if sync:
             _do_fetch()
@@ -1026,8 +1037,9 @@ class ADSBLogger:
               <th>Zeit (UTC)</th>
               <th>Rufzeichen</th>
               <th>Hex</th>
-              <th>Route</th>
-              <th>Airline</th>
+              <th>Start</th>
+              <th>Ziel</th>
+              <th>Route / Airline</th>
               <th>Typ / Reg</th>
               <th>Höhe (Min / Max)</th>
               <th>Max Speed</th>
@@ -1036,7 +1048,7 @@ class ADSBLogger:
             </tr>
           </thead>
           <tbody id="csv-tbody">
-            <tr><td colspan="10" style="text-align: center; color: var(--text-muted); padding: 20px;">Lade CSV-Daten...</td></tr>
+            <tr><td colspan="11" style="text-align: center; color: var(--text-muted); padding: 20px;">Lade CSV-Daten...</td></tr>
           </tbody>
         </table>
       </div>
@@ -1106,7 +1118,7 @@ class ADSBLogger:
     function renderTable(rows) {
       const tbody = document.getElementById('csv-tbody');
       if (!rows || rows.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="10" style="text-align: center; color: var(--text-muted); padding: 20px;">Noch keine Flüge geloggt.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="11" style="text-align: center; color: var(--text-muted); padding: 20px;">Noch keine Flüge geloggt.</td></tr>';
         return;
       }
       tbody.innerHTML = rows.map(r => `
@@ -1114,8 +1126,9 @@ class ADSBLogger:
           <td style="color: #94a3b8; font-family: monospace;">${r.first_seen_utc || ''}</td>
           <td><strong style="color: #38bdf8;">${r.callsign || '<span style="color:#64748b">kein Callsign</span>'}</strong></td>
           <td><code style="color: #fbbf24;">${r.icao_hex || ''}</code></td>
-          <td style="color: #a7f3d0;">${r.route || '-'}</td>
-          <td>${r.airline || '-'}</td>
+          <td><span style="color: #34d399; font-weight: 600; background: rgba(52, 211, 153, 0.1); padding: 2px 6px; border-radius: 4px;">${r.origin || '-'}</span></td>
+          <td><span style="color: #f472b6; font-weight: 600; background: rgba(244, 114, 182, 0.1); padding: 2px 6px; border-radius: 4px;">${r.destination || '-'}</span></td>
+          <td style="color: #a7f3d0;">${r.route || r.airline || '-'}</td>
           <td>${r.type_code || ''} ${r.registration ? '(' + r.registration + ')' : ''}</td>
           <td>${r.altitude_min_ft || '-'} / ${r.altitude_max_ft || '-'} ft</td>
           <td>${r.speed_max_kts ? r.speed_max_kts + ' kts' : '-'}</td>
@@ -1134,6 +1147,8 @@ class ADSBLogger:
       const filtered = rawRows.filter(r => 
         (r.callsign && r.callsign.toLowerCase().includes(q)) ||
         (r.icao_hex && r.icao_hex.toLowerCase().includes(q)) ||
+        (r.origin && r.origin.toLowerCase().includes(q)) ||
+        (r.destination && r.destination.toLowerCase().includes(q)) ||
         (r.route && r.route.toLowerCase().includes(q)) ||
         (r.airline && r.airline.toLowerCase().includes(q)) ||
         (r.registration && r.registration.toLowerCase().includes(q))
