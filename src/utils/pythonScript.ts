@@ -1151,16 +1151,41 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# 2. Benutzer & Verzeichnisse ermitteln
-if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+# 2. Benutzer, Gruppe & Verzeichnisse ermitteln
+TARGET_USER=""
+if [ -n "$SUDO_USER" ] && id "$SUDO_USER" &>/dev/null; then
   TARGET_USER="$SUDO_USER"
+elif id -un 1000 &>/dev/null; then
+  TARGET_USER=$(id -un 1000 2>/dev/null)
+elif id "pi" &>/dev/null; then
+  TARGET_USER="pi"
+elif id "dietpi" &>/dev/null; then
+  TARGET_USER="dietpi"
+elif id "ubuntu" &>/dev/null; then
+  TARGET_USER="ubuntu"
+elif [ -n "$USER" ] && id "$USER" &>/dev/null; then
+  TARGET_USER="$USER"
 else
-  TARGET_USER=$(id -un 1000 2>/dev/null || echo "pi")
+  TARGET_USER=$(whoami 2>/dev/null || echo "root")
 fi
 
-TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
-if [ -z "$TARGET_HOME" ]; then
-  TARGET_HOME="/home/$TARGET_USER"
+# Validiere Benutzer
+if ! id "$TARGET_USER" &>/dev/null; then
+  TARGET_USER="root"
+fi
+
+TARGET_GROUP=$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")
+if ! getent group "$TARGET_GROUP" &>/dev/null; then
+  TARGET_GROUP=$(id -g "$TARGET_USER" 2>/dev/null || echo "0")
+fi
+
+TARGET_HOME=$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6)
+if [ -z "$TARGET_HOME" ] || [ ! -d "$TARGET_HOME" ]; then
+  if [ "$TARGET_USER" = "root" ]; then
+    TARGET_HOME="/root"
+  else
+    TARGET_HOME="/home/$TARGET_USER"
+  fi
 fi
 
 INSTALL_DIR="${installDir}"
@@ -1168,7 +1193,7 @@ DATA_DIR="${csvDir}"
 SERVICE_FILE="/etc/systemd/system/${serviceName}.service"
 WEB_PORT="${webPort}"
 
-echo -e "\${GREEN}[✓]\${NC} Ziel-Benutzer: \${YELLOW}$TARGET_USER\${NC} (Home: $TARGET_HOME)"
+echo -e "\${GREEN}[✓]\${NC} Ziel-Benutzer: \${YELLOW}$TARGET_USER\${NC} (Gruppe: \${YELLOW}$TARGET_GROUP\${NC}, Home: \${YELLOW}$TARGET_HOME\${NC})"
 echo ""
 
 # 3. Interaktive Abfrage: Installations-Variante (Lokal vs. Netzwerk)
@@ -1270,7 +1295,9 @@ echo -e "\${BLUE}[2/4]\${NC} Erstelle Verzeichnisse & installiere Python-Skript.
 mkdir -p "$INSTALL_DIR"
 mkdir -p "$DATA_DIR"
 
-chown -R "$TARGET_USER:$TARGET_USER" "$DATA_DIR"
+if id "$TARGET_USER" &>/dev/null; then
+  chown -R "$TARGET_USER:$TARGET_GROUP" "$DATA_DIR" 2>/dev/null || chown -R "$TARGET_USER" "$DATA_DIR" 2>/dev/null || true
+fi
 
 # Schreibe adsb_logger.py
 cat << 'EOF_PYTHON' > "$INSTALL_DIR/adsb_logger.py"
@@ -1278,7 +1305,9 @@ ${PYTHON_SCRIPT_CODE}
 EOF_PYTHON
 
 chmod +x "$INSTALL_DIR/adsb_logger.py"
-chown -R "$TARGET_USER:$TARGET_USER" "$INSTALL_DIR"
+if id "$TARGET_USER" &>/dev/null; then
+  chown -R "$TARGET_USER:$TARGET_GROUP" "$INSTALL_DIR" 2>/dev/null || chown -R "$TARGET_USER" "$INSTALL_DIR" 2>/dev/null || true
+fi
 echo -e "\${GREEN}[✓]\${NC} Skript installiert in: \${YELLOW}$INSTALL_DIR/adsb_logger.py\${NC}"
 
 # 7. Systemd Hintergrunddienst einrichten
@@ -1293,7 +1322,7 @@ Wants=network.target
 [Service]
 Type=simple
 User=$TARGET_USER
-Group=$TARGET_USER
+Group=$TARGET_GROUP
 WorkingDirectory=$DATA_DIR
 ExecStart=/usr/bin/python3 $INSTALL_DIR/adsb_logger.py --source "$TARGET_SOURCE" --output "$DATA_DIR/flights.csv" --interval $POLL_INTERVAL --timeout 300.0 --dedup-mode daily --port $WEB_PORT
 Restart=always
