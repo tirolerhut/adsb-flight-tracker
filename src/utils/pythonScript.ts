@@ -37,11 +37,13 @@ import threading
 import urllib.request
 import urllib.error
 import urllib.parse
+import io
+import email.utils
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from typing import Dict, Any, Optional, Set, List
 
-SCRIPT_VERSION = "2.4.0"
+SCRIPT_VERSION = "2.5.0"
 DEFAULT_GITHUB_REPO = "tirolerhut/adsb-flight-tracker"
 DEFAULT_GITHUB_BRANCH = "main"
 
@@ -347,23 +349,105 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
         # Silence standard HTTP access logging to keep terminal clean
         pass
 
+    def send_cors_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Expose-Headers", "*")
+
     def send_json(self, data: Any, status: int = 200):
         body = json.dumps(data, indent=2).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-cache, no-transform, must-revalidate")
+        self.send_cors_headers()
         self.end_headers()
         self.wfile.write(body)
 
     def do_OPTIONS(self):
         self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_cors_headers()
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def do_HEAD(self):
+        self._handle_request(is_head=True)
+
     def do_GET(self):
+        self._handle_request(is_head=False)
+
+    def _serve_csv(self, is_head: bool = False, query: Optional[Dict[str, List[str]]] = None, force_download: bool = False):
+        logger = self.logger_instance
+        query = query or {}
+        download_flag = force_download or query.get("download", ["0"])[0].lower() in ("1", "true", "yes") or query.get("dl", ["0"])[0].lower() in ("1", "true", "yes")
+        limit_param = query.get("limit", [None])[0]
+        since_param = query.get("since", [None])[0]
+        sep_param = query.get("sep", [","])[0]
+
+        last_mod_time = time.time()
+        filename = os.path.basename(logger.csv_path) if logger and logger.csv_path else "flights.csv"
+
+        if logger and os.path.exists(logger.csv_path):
+            try:
+                last_mod_time = os.path.getmtime(logger.csv_path)
+            except Exception:
+                pass
+
+        if limit_param or since_param or sep_param != ",":
+            limit = None
+            if limit_param:
+                try:
+                    limit = int(limit_param)
+                except ValueError:
+                    limit = None
+
+            rows = []
+            if logger and os.path.exists(logger.csv_path):
+                with open(logger.csv_path, "r", encoding="utf-8", errors="replace") as f:
+                    reader = csv.DictReader(f)
+                    for r in reader:
+                        if since_param and r.get("first_seen_utc", "") < since_param:
+                            continue
+                        rows.append(r)
+            if limit and limit > 0:
+                rows = rows[-limit:]
+
+            output_io = io.StringIO()
+            writer = csv.DictWriter(output_io, fieldnames=CSV_FIELDNAMES, delimiter=sep_param, extrasaction="ignore")
+            writer.writeheader()
+            for r in rows:
+                writer.writerow(r)
+            content_bytes = output_io.getvalue().encode("utf-8")
+        else:
+            if logger and os.path.exists(logger.csv_path) and os.path.getsize(logger.csv_path) > 0:
+                try:
+                    with open(logger.csv_path, "rb") as f:
+                        content_bytes = f.read()
+                except Exception:
+                    content_bytes = (",".join(CSV_FIELDNAMES) + "\n").encode("utf-8")
+            else:
+                content_bytes = (",".join(CSV_FIELDNAMES) + "\n").encode("utf-8")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        disposition_type = "attachment" if download_flag else "inline"
+        self.send_header("Content-Disposition", f'{disposition_type}; filename="{filename}"')
+        self.send_header("Content-Length", str(len(content_bytes)))
+        self.send_header("Cache-Control", "no-cache, no-transform, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        try:
+            self.send_header("Last-Modified", email.utils.formatdate(last_mod_time, usegmt=True))
+        except Exception:
+            pass
+        self.send_cors_headers()
+        self.end_headers()
+
+        if not is_head:
+            self.wfile.write(content_bytes)
+
+    def _handle_request(self, is_head: bool = False):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         logger = self.logger_instance
@@ -378,37 +462,39 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.send_cors_headers()
             self.end_headers()
-            self.wfile.write(body)
+            if not is_head:
+                self.wfile.write(body)
             return
 
         elif path == "/api/status":
-            self.send_json(logger.get_status_dict())
+            if is_head:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_cors_headers()
+                self.end_headers()
+            else:
+                self.send_json(logger.get_status_dict())
             return
 
-        elif path in ("/api/csv", "/download", "/flights.csv"):
-            if not os.path.exists(logger.csv_path):
-                self.send_error(404, "CSV file not found")
-                return
-            try:
-                with open(logger.csv_path, "rb") as f:
-                    content = f.read()
-                filename = os.path.basename(logger.csv_path) or "flights.csv"
-                self.send_response(200)
-                self.send_header("Content-Type", "text/csv; charset=utf-8")
-                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
-                self.send_header("Content-Length", str(len(content)))
-                self.end_headers()
-                self.wfile.write(content)
-            except Exception as e:
-                self.send_error(500, f"Error reading CSV: {e}")
+        elif path in ("/api/csv", "/flights.csv", "/data/flights.csv", "/csv", "/download", "/api/flights.csv"):
+            query = urllib.parse.parse_qs(parsed.query)
+            force_dl = (path == "/download")
+            self._serve_csv(is_head=is_head, query=query, force_download=force_dl)
             return
 
         elif path == "/api/csv_preview":
             query = urllib.parse.parse_qs(parsed.query)
             limit = int(query.get("limit", [50])[0])
             rows = logger.get_csv_recent_rows(limit=limit)
-            self.send_json({"rows": rows, "count": len(rows), "total": len(logger.logged_uids)})
+            if is_head:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_cors_headers()
+                self.end_headers()
+            else:
+                self.send_json({"rows": rows, "count": len(rows), "total": len(logger.logged_uids)})
             return
 
         elif path == "/api/update_check":
@@ -418,7 +504,13 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
             raw_url = query.get("raw_url", [""])[0]
             try:
                 result = logger.check_github_update(repo=repo, branch=branch, raw_url=raw_url)
-                self.send_json(result)
+                if is_head:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_cors_headers()
+                    self.end_headers()
+                else:
+                    self.send_json(result)
             except Exception as e:
                 self.send_json({"success": False, "error": f"Fehler bei GitHub Update-Prüfung: {e}"}, status=500)
             return
@@ -1044,10 +1136,62 @@ class ADSBLogger:
           <div><strong style="color: #94a3b8;">Skript:</strong> <code style="color: #93c5fd; word-break: break-all;" id="info-script-path">-</code></div>
           <div><strong style="color: #94a3b8;">CSV-Datei:</strong> <code style="color: #67e8f9; word-break: break-all;" id="info-csv-path">-</code></div>
           <div><strong style="color: #94a3b8;">REST Status API:</strong> <a href="/api/status" target="_blank" style="color: #60a5fa;">GET /api/status</a></div>
-          <div><strong style="color: #94a3b8;">CSV Download:</strong> <a href="/api/csv" style="color: #34d399;">GET /api/csv</a></div>
+          <div><strong style="color: #94a3b8;">HTTP CSV Stream:</strong> <a href="/flights.csv" target="_blank" style="color: #34d399;">GET /flights.csv</a></div>
           <div><strong style="color: #94a3b8;">Vorschau API:</strong> <a href="/api/csv_preview" target="_blank" style="color: #60a5fa;">GET /api/csv_preview</a></div>
           <div id="info-error" style="color: #f87171; display: none;"></div>
         </div>
+      </div>
+    </div>
+
+    <!-- HTTP CSV Schnittstelle & Automatisierte Datenanalyse -->
+    <div class="card" style="border-color: #10b981; background: linear-gradient(180deg, #111827 0%, #0f172a 100%);">
+      <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 12px;">
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <h2 style="font-size: 15px; font-weight: 700; color: #34d399;">🌐 HTTP CSV-Quelle für automatische Datenanalysen</h2>
+          <span class="badge" style="background: rgba(16, 185, 129, 0.15); color: #6ee7b7; border-color: rgba(16, 185, 129, 0.3);">REST & Stream API</span>
+        </div>
+        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+          <a id="btn-open-csv" href="/flights.csv" target="_blank" class="btn btn-secondary" style="font-size: 12px; padding: 5px 10px;">🔗 Im Browser öffnen</a>
+          <a id="btn-dl-csv" href="/api/csv?download=1" class="btn btn-emerald" style="font-size: 12px; padding: 5px 10px;">📥 CSV herunterladen</a>
+        </div>
+      </div>
+      
+      <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
+        Die CSV-Datei wird live über standardkonforme HTTP-Endpunkte mit <code>CORS (Access-Control-Allow-Origin: *)</code>, <code>HEAD</code>-Unterstützung und <code>Last-Modified</code> Zeitstempeln bereitgestellt. Ideal für automatisiertes Einlesen in <strong>Python (Pandas/Polars)</strong>, <strong>DuckDB</strong>, <strong>R</strong>, <strong>Excel / Power Query</strong> oder <strong>Cronjobs / cURL</strong>.
+      </p>
+
+      <!-- URL Bar mit Kopier-Button -->
+      <div class="form-group" style="margin-bottom: 14px;">
+        <label style="font-size: 11px; color: #94a3b8; font-weight: 600;">DIREKTE HTTP-CSV URL (FÜR ANALYSE-SKRIPTE):</label>
+        <div style="display: flex; gap: 8px; align-items: center;">
+          <input type="text" id="http-csv-url-input" readonly style="font-family: monospace; font-size: 13px; color: #38bdf8; background: #0b1120; font-weight: 600; cursor: text;" value="http://localhost:7001/flights.csv">
+          <button type="button" class="btn btn-primary" onclick="copyCsvUrl()" id="btn-copy-csv-url" style="white-space: nowrap;">📋 Link kopieren</button>
+        </div>
+      </div>
+
+      <!-- Code Snippets Box -->
+      <div style="background: #090d16; border: 1px solid var(--card-border); border-radius: 8px; padding: 12px;">
+        <div style="display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap;" id="snippet-tab-buttons">
+          <button type="button" class="btn btn-secondary snippet-tab" onclick="setSnippetTab('pandas')" id="tab-btn-pandas" style="font-size: 11px; padding: 4px 10px;">🐍 Python (Pandas)</button>
+          <button type="button" class="btn btn-secondary snippet-tab" onclick="setSnippetTab('duckdb')" id="tab-btn-duckdb" style="font-size: 11px; padding: 4px 10px;">🦆 DuckDB / SQL</button>
+          <button type="button" class="btn btn-secondary snippet-tab" onclick="setSnippetTab('r')" id="tab-btn-r" style="font-size: 11px; padding: 4px 10px;">📈 R</button>
+          <button type="button" class="btn btn-secondary snippet-tab" onclick="setSnippetTab('excel')" id="tab-btn-excel" style="font-size: 11px; padding: 4px 10px;">📊 Excel & Sheets</button>
+          <button type="button" class="btn btn-secondary snippet-tab" onclick="setSnippetTab('curl')" id="tab-btn-curl" style="font-size: 11px; padding: 4px 10px;">💻 cURL / Cron</button>
+        </div>
+
+        <pre id="snippet-code-box" style="background: #040711; color: #a5f3fc; padding: 10px 12px; border-radius: 6px; font-family: monospace; font-size: 12px; overflow-x: auto; margin: 0; white-space: pre-wrap; line-height: 1.5;"></pre>
+        
+        <div style="display: flex; justify-content: flex-end; margin-top: 8px;">
+          <button type="button" class="btn btn-secondary" onclick="copySnippetCode()" id="btn-copy-snippet" style="font-size: 11px; padding: 3px 10px;">📋 Code kopieren</button>
+        </div>
+      </div>
+
+      <!-- Parameter Quick-Guide -->
+      <div style="margin-top: 12px; font-size: 11px; color: #94a3b8; display: flex; gap: 14px; flex-wrap: wrap;">
+        <div>🔹 <code>/flights.csv</code> Vollständige Datei</div>
+        <div>🔹 <code>/api/csv?limit=500</code> Neueste 500 Zeilen</div>
+        <div>🔹 <code>/api/csv?since=2026-08-25</code> Ab Datum/Zeit</div>
+        <div>🔹 <code>/api/csv?sep=;</code> Semikolon-Trennzeichen (Excel)</div>
       </div>
     </div>
 
@@ -1335,7 +1479,84 @@ class ADSBLogger:
       }
     }
 
+    let currentSnippetTab = 'pandas';
+
+    function getCsvUrl() {
+      return window.location.origin + '/flights.csv';
+    }
+
+    function getSnippets() {
+      const csvUrl = getCsvUrl();
+      const origin = window.location.origin;
+      return {
+        pandas: '# 🐍 Python (Pandas) Datenanalyse über HTTP\\nimport pandas as pd\\n\\nurl = "' + csvUrl + '"\\ndf = pd.read_csv(url)\\n\\nprint(f"Geloggte Flüge: {len(df)}")\\nprint(df[[\'first_seen_utc\', \'callsign\', \'airline\', \'origin\', \'destination\', \'altitude_max_ft\', \'speed_max_kts\']].head(10))\\n\\n# Analyse: Top Airlines\\nprint("\\\\nTop Airlines:")\\nprint(df[\'airline\'].value_counts().head(5))',
+        duckdb: '-- 🦆 DuckDB / SQL - Direktabfrage über HTTP\\nSELECT \\n    callsign, \\n    airline, \\n    origin || \' ➔ \' || destination AS route, \\n    altitude_max_ft, \\n    speed_max_kts, \\n    first_seen_utc\\nFROM read_csv_auto(\'' + csvUrl + '\')\\nWHERE callsign IS NOT NULL\\nORDER BY first_seen_utc DESC\\nLIMIT 20;',
+        r: '# 📈 R Data Analysis über HTTP\\nurl <- "' + csvUrl + '"\\nflights <- read.csv(url, stringsAsFactors = FALSE, encoding = "UTF-8")\\n\\ncat("Flüge gesamt:", nrow(flights), "\\\\n")\\nhead(flights[, c("first_seen_utc", "callsign", "airline", "origin", "destination")])\\nsummary(flights$altitude_max_ft)',
+        excel: '# 📊 Excel & Google Sheets Live-Datenquelle\\n\\nMicrosoft Excel:\\n1. Menü: Daten ➔ Aus dem Web\\n2. URL eingeben: ' + csvUrl + '\\n3. \'Laden\' wählen (Aktualisiert auf Knopfdruck oder im Intervall)\\n\\nGoogle Sheets (Zelle A1):\\n=IMPORTDATA("' + csvUrl + '")',
+        curl: '# 💻 cURL & Cronjob Backup\\n# 1. Gesamte CSV herunterladen:\\ncurl -sSL "' + csvUrl + '" -o /tmp/flights.csv\\n\\n# 2. Nur die neuesten 100 Flüge abfragen:\\ncurl -sSL "' + origin + '/api/csv?limit=100" -o /tmp/recent_flights.csv\\n\\n# 3. 15-Minuten Cronjob zur Archivierung:\\n# */15 * * * * curl -sSL "' + csvUrl + '" -o ~/archive_$(date +\\\\%Y\\\\%m\\\\%d_\\\\%H\\\\%M).csv'
+      };
+    }
+
+    function setSnippetTab(tab) {
+      currentSnippetTab = tab;
+      const tabs = ['pandas', 'duckdb', 'r', 'excel', 'curl'];
+      tabs.forEach(t => {
+        const btn = document.getElementById('tab-btn-' + t);
+        if (btn) {
+          if (t === tab) {
+            btn.style.background = '#2563eb';
+            btn.style.color = '#fff';
+            btn.style.borderColor = '#3b82f6';
+          } else {
+            btn.style.background = '#1e293b';
+            btn.style.color = '#cbd5e1';
+            btn.style.borderColor = 'transparent';
+          }
+        }
+      });
+      const snippets = getSnippets();
+      const code = (snippets[tab] || '').replace(/\\\\n/g, '\\n');
+      document.getElementById('snippet-code-box').textContent = code;
+    }
+
+    function copyCsvUrl() {
+      const url = getCsvUrl();
+      navigator.clipboard.writeText(url);
+      const btn = document.getElementById('btn-copy-csv-url');
+      const orig = btn.textContent;
+      btn.textContent = '✅ Kopiert!';
+      btn.style.background = '#059669';
+      setTimeout(() => {
+        btn.textContent = orig;
+        btn.style.background = '';
+      }, 2000);
+    }
+
+    function copySnippetCode() {
+      const snippets = getSnippets();
+      const code = (snippets[currentSnippetTab] || '').replace(/\\\\n/g, '\\n');
+      navigator.clipboard.writeText(code);
+      const btn = document.getElementById('btn-copy-snippet');
+      const orig = btn.textContent;
+      btn.textContent = '✅ Code kopiert!';
+      setTimeout(() => {
+        btn.textContent = orig;
+      }, 2000);
+    }
+
+    function updateHttpUrls() {
+      const csvUrl = getCsvUrl();
+      const inputEl = document.getElementById('http-csv-url-input');
+      if (inputEl) inputEl.value = csvUrl;
+      const openBtn = document.getElementById('btn-open-csv');
+      if (openBtn) openBtn.href = csvUrl;
+      const dlBtn = document.getElementById('btn-dl-csv');
+      if (dlBtn) dlBtn.href = window.location.origin + '/api/csv?download=1';
+      setSnippetTab(currentSnippetTab);
+    }
+
     // Initial load & Polling
+    updateHttpUrls();
     loadStatus();
     loadPreview();
     setInterval(loadStatus, 3000);
