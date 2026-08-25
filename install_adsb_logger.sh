@@ -836,14 +836,14 @@ class ADSBLogger:
             return []
 
     def generate_dashboard_html(self) -> str:
-        return f"""<!DOCTYPE html>
+        html = """<!DOCTYPE html>
 <html lang="de">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ADS-B Logger Web Control (Port {self.web_port})</title>
+  <title>ADS-B Logger Web Control (Port __WEB_PORT__)</title>
   <style>
-    :root {{
+    :root {
       --bg: #0f172a;
       --card-bg: #1e293b;
       --card-border: #334155;
@@ -854,79 +854,79 @@ class ADSBLogger:
       --red: #ef4444;
       --text: #f8fafc;
       --text-muted: #94a3b8;
-    }}
-    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
       background-color: var(--bg);
       color: var(--text);
       padding: 20px;
       line-height: 1.5;
-    }}
-    .container {{ max-width: 1200px; margin: 0 auto; display: flex; flex-direction: column; gap: 20px; }}
-    header {{
+    }
+    .container { max-width: 1200px; margin: 0 auto; display: flex; flex-direction: column; gap: 20px; }
+    header {
       display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;
       border-bottom: 1px solid var(--card-border); padding-bottom: 16px;
-    }}
-    .badge {{
+    }
+    .badge {
       display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 9999px;
       font-size: 12px; font-weight: 600; background: rgba(16, 185, 129, 0.15); color: var(--emerald);
       border: 1px solid rgba(16, 185, 129, 0.3);
-    }}
-    .pulse {{ width: 8px; height: 8px; border-radius: 50%; background: var(--emerald); animation: pulse 2s infinite; }}
-    @keyframes pulse {{ 0%, 100% {{ opacity: 1; transform: scale(1); }} 50% {{ opacity: 0.4; transform: scale(0.8); }} }}
+    }
+    .pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--emerald); animation: pulse 2s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(0.8); } }
     
-    .grid-stats {{
+    .grid-stats {
       display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px;
-    }}
-    .card {{
+    }
+    .card {
       background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 12px; padding: 18px;
-    }}
-    .card-title {{ font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 6px; }}
-    .card-value {{ font-size: 24px; font-weight: 700; color: var(--text); }}
-    .card-sub {{ font-size: 11px; color: var(--text-muted); margin-top: 4px; }}
+    }
+    .card-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 6px; }
+    .card-value { font-size: 24px; font-weight: 700; color: var(--text); }
+    .card-sub { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
     
-    .grid-main {{
+    .grid-main {
       display: grid; grid-template-columns: 1fr 1fr; gap: 20px;
-    }}
-    @media (max-width: 900px) {{ .grid-main {{ grid-template-columns: 1fr; }} }}
+    }
+    @media (max-width: 900px) { .grid-main { grid-template-columns: 1fr; } }
     
-    .form-group {{ margin-bottom: 14px; }}
-    label {{ display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; color: #cbd5e1; }}
-    input[type="text"], input[type="number"] {{
+    .form-group { margin-bottom: 14px; }
+    label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; color: #cbd5e1; }
+    input[type="text"], input[type="number"] {
       width: 100%; padding: 10px 12px; background: #0b1120; border: 1px solid var(--card-border);
       border-radius: 8px; color: #fff; font-family: monospace; font-size: 13px;
-    }}
-    input:focus {{ outline: none; border-color: var(--accent); }}
+    }
+    input:focus { outline: none; border-color: var(--accent); }
     
-    .btn-group {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }}
-    button, .btn {{
+    .btn-group { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    button, .btn {
       display: inline-flex; align-items: center; gap: 6px; padding: 9px 16px; border-radius: 8px;
       font-size: 13px; font-weight: 600; cursor: pointer; border: none; text-decoration: none; transition: all 0.15s;
-    }}
-    .btn-primary {{ background: var(--accent); color: #fff; }}
-    .btn-primary:hover {{ background: var(--accent-hover); }}
-    .btn-secondary {{ background: #334155; color: #f1f5f9; }}
-    .btn-secondary:hover {{ background: #475569; }}
-    .btn-emerald {{ background: #059669; color: #fff; }}
-    .btn-emerald:hover {{ background: #047857; }}
-    .btn-danger {{ background: #dc2626; color: #fff; }}
-    .btn-danger:hover {{ background: #b91c1c; }}
+    }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-secondary { background: #334155; color: #f1f5f9; }
+    .btn-secondary:hover { background: #475569; }
+    .btn-emerald { background: #059669; color: #fff; }
+    .btn-emerald:hover { background: #047857; }
+    .btn-danger { background: #dc2626; color: #fff; }
+    .btn-danger:hover { background: #b91c1c; }
     
-    .table-container {{
+    .table-container {
       overflow-x: auto; max-height: 480px; overflow-y: auto; border: 1px solid var(--card-border);
       border-radius: 8px; background: #0b1120; margin-top: 12px;
-    }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 12px; text-align: left; }}
-    th {{ background: #1e293b; padding: 10px 12px; position: sticky; top: 0; color: #94a3b8; font-weight: 600; border-bottom: 1px solid var(--card-border); }}
-    td {{ padding: 8px 12px; border-bottom: 1px solid #1e293b; white-space: nowrap; }}
-    tr:hover {{ background: rgba(255,255,255,0.03); }}
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; text-align: left; }
+    th { background: #1e293b; padding: 10px 12px; position: sticky; top: 0; color: #94a3b8; font-weight: 600; border-bottom: 1px solid var(--card-border); }
+    td { padding: 8px 12px; border-bottom: 1px solid #1e293b; white-space: nowrap; }
+    tr:hover { background: rgba(255,255,255,0.03); }
     
-    .banner-alert {{
+    .banner-alert {
       padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 14px; display: none;
-    }}
-    .banner-success {{ background: rgba(16, 185, 129, 0.2); border: 1px solid var(--emerald); color: #a7f3d0; }}
-    .banner-error {{ background: rgba(239, 68, 68, 0.2); border: 1px solid var(--red); color: #fecaca; }}
+    }
+    .banner-success { background: rgba(16, 185, 129, 0.2); border: 1px solid var(--emerald); color: #a7f3d0; }
+    .banner-error { background: rgba(239, 68, 68, 0.2); border: 1px solid var(--red); color: #fecaca; }
   </style>
 </head>
 <body>
@@ -934,7 +934,7 @@ class ADSBLogger:
     <header>
       <div>
         <h1 style="font-size: 20px; font-weight: 700;">✈️ ADS-B Flight Logger & Control</h1>
-        <p style="font-size: 12px; color: var(--text-muted);">Webinterface auf Port {self.web_port} &bull; Raspberry Pi Daemon</p>
+        <p style="font-size: 12px; color: var(--text-muted);">Webinterface auf Port __WEB_PORT__ &bull; Raspberry Pi Daemon</p>
       </div>
       <div style="display: flex; gap: 10px; align-items: center;">
         <span class="badge" id="status-badge"><span class="pulse"></span> AKTIV & LOGGING</span>
@@ -1183,6 +1183,72 @@ class ADSBLogger:
   </script>
 </body>
 </html>
+"""
+        return html.replace("__WEB_PORT__", str(self.web_port))
+
+    def run(self):
+        def _sig_handler(sig, frame):
+            self.running = False
+
+        signal.signal(signal.SIGINT, _sig_handler)
+        signal.signal(signal.SIGTERM, _sig_handler)
+
+        print(f"ADS-B Logger gestartet.")
+        print(f"Quelle: {self.source} | Intervall: {self.interval}s | CSV: {self.csv_path}")
+        print(f"Web Dashboard aktiv unter: http://0.0.0.0:{self.web_port}")
+        
+        while self.running:
+            try:
+                data = self.fetch_data()
+                if data:
+                    self.process(data)
+                    with_cs = sum(1 for f in self.active_flights.values() if f.has_valid_callsign())
+                    sys.stdout.write(f"\r[STATUS] Im Luftraum: {len(self.active_flights)} ({with_cs} mit Flugnr.) | Geloggt: {len(self.logged_uids)} | Web: :{self.web_port}")
+                    sys.stdout.flush()
+                time.sleep(self.interval)
+            except KeyboardInterrupt:
+                self.running = False
+                break
+            except Exception as e:
+                print(f"\n[FEHLER im Polling-Loop]: {e}", file=sys.stderr)
+                time.sleep(self.interval)
+
+        print("\nBeende Logger... Speichere verbleibende Flüge mit gültiger Flugnummer.")
+        with self.lock:
+            for h, f in self.active_flights.items():
+                if f.has_valid_callsign():
+                    uid = f.get_flight_uid(self.dedup_mode)
+                    if uid not in self.logged_uids:
+                        self._write(f, uid)
+                        self.logged_uids.add(uid)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="ADS-B aircraft.json Logger & Web Dashboard")
+    parser.add_argument("--source", "-s", default="/run/readsb/aircraft.json", help="Pfad oder HTTP-URL zur aircraft.json")
+    parser.add_argument("--output", "-o", default="flights.csv", help="CSV-Ausgabedatei")
+    parser.add_argument("--interval", "-i", type=float, default=5.0, help="Polling-Intervall in Sek")
+    parser.add_argument("--timeout", "-t", type=float, default=300.0, help="Inaktivitäts-Timeout in Sek")
+    parser.add_argument("--dedup-mode", "-d", choices=["daily", "strict_forever", "hex_only"], default="daily")
+    parser.add_argument("--immediate", action="store_true", help="Sofort bei Erhalt der Flugnummer loggen")
+    parser.add_argument("--port", "-p", type=int, default=7001, help="Port für das integrierte Webinterface (Standard: 7001)")
+    parser.add_argument("--no-adsbdb", action="store_true", help="ADSBDB Online-Routenabfrage deaktivieren")
+    args = parser.parse_args()
+
+    logger = ADSBLogger(
+        source=args.source,
+        csv_path=args.output,
+        interval=args.interval,
+        timeout_gap=args.timeout,
+        dedup_mode=args.dedup_mode,
+        immediate=args.immediate,
+        query_adsbdb=not args.no_adsbdb,
+        web_port=args.port
+    )
+    logger.run()
+
+if __name__ == "__main__":
+    main()
 EOF_PYTHON
 
 chmod +x "$INSTALL_DIR/adsb_logger.py"

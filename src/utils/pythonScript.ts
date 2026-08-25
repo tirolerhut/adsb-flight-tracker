@@ -635,14 +635,14 @@ class ADSBLogger:
             return []
 
     def generate_dashboard_html(self) -> str:
-        return f"""<!DOCTYPE html>
+        html = """<!DOCTYPE html>
 <html lang="de">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ADS-B Logger Web Control (Port {self.web_port})</title>
+  <title>ADS-B Logger Web Control (Port __WEB_PORT__)</title>
   <style>
-    :root {{
+    :root {
       --bg: #0f172a;
       --card-bg: #1e293b;
       --card-border: #334155;
@@ -653,79 +653,79 @@ class ADSBLogger:
       --red: #ef4444;
       --text: #f8fafc;
       --text-muted: #94a3b8;
-    }}
-    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
       background-color: var(--bg);
       color: var(--text);
       padding: 20px;
       line-height: 1.5;
-    }}
-    .container {{ max-width: 1200px; margin: 0 auto; display: flex; flex-direction: column; gap: 20px; }}
-    header {{
+    }
+    .container { max-width: 1200px; margin: 0 auto; display: flex; flex-direction: column; gap: 20px; }
+    header {
       display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;
       border-bottom: 1px solid var(--card-border); padding-bottom: 16px;
-    }}
-    .badge {{
+    }
+    .badge {
       display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 9999px;
       font-size: 12px; font-weight: 600; background: rgba(16, 185, 129, 0.15); color: var(--emerald);
       border: 1px solid rgba(16, 185, 129, 0.3);
-    }}
-    .pulse {{ width: 8px; height: 8px; border-radius: 50%; background: var(--emerald); animation: pulse 2s infinite; }}
-    @keyframes pulse {{ 0%, 100% {{ opacity: 1; transform: scale(1); }} 50% {{ opacity: 0.4; transform: scale(0.8); }} }}
+    }
+    .pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--emerald); animation: pulse 2s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(0.8); } }
     
-    .grid-stats {{
+    .grid-stats {
       display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px;
-    }}
-    .card {{
+    }
+    .card {
       background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 12px; padding: 18px;
-    }}
-    .card-title {{ font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 6px; }}
-    .card-value {{ font-size: 24px; font-weight: 700; color: var(--text); }}
-    .card-sub {{ font-size: 11px; color: var(--text-muted); margin-top: 4px; }}
+    }
+    .card-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 6px; }
+    .card-value { font-size: 24px; font-weight: 700; color: var(--text); }
+    .card-sub { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
     
-    .grid-main {{
+    .grid-main {
       display: grid; grid-template-columns: 1fr 1fr; gap: 20px;
-    }}
-    @media (max-width: 900px) {{ .grid-main {{ grid-template-columns: 1fr; }} }}
+    }
+    @media (max-width: 900px) { .grid-main { grid-template-columns: 1fr; } }
     
-    .form-group {{ margin-bottom: 14px; }}
-    label {{ display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; color: #cbd5e1; }}
-    input[type="text"], input[type="number"] {{
+    .form-group { margin-bottom: 14px; }
+    label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; color: #cbd5e1; }
+    input[type="text"], input[type="number"] {
       width: 100%; padding: 10px 12px; background: #0b1120; border: 1px solid var(--card-border);
       border-radius: 8px; color: #fff; font-family: monospace; font-size: 13px;
-    }}
-    input:focus {{ outline: none; border-color: var(--accent); }}
+    }
+    input:focus { outline: none; border-color: var(--accent); }
     
-    .btn-group {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }}
-    button, .btn {{
+    .btn-group { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    button, .btn {
       display: inline-flex; align-items: center; gap: 6px; padding: 9px 16px; border-radius: 8px;
       font-size: 13px; font-weight: 600; cursor: pointer; border: none; text-decoration: none; transition: all 0.15s;
-    }}
-    .btn-primary {{ background: var(--accent); color: #fff; }}
-    .btn-primary:hover {{ background: var(--accent-hover); }}
-    .btn-secondary {{ background: #334155; color: #f1f5f9; }}
-    .btn-secondary:hover {{ background: #475569; }}
-    .btn-emerald {{ background: #059669; color: #fff; }}
-    .btn-emerald:hover {{ background: #047857; }}
-    .btn-danger {{ background: #dc2626; color: #fff; }}
-    .btn-danger:hover {{ background: #b91c1c; }}
+    }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-secondary { background: #334155; color: #f1f5f9; }
+    .btn-secondary:hover { background: #475569; }
+    .btn-emerald { background: #059669; color: #fff; }
+    .btn-emerald:hover { background: #047857; }
+    .btn-danger { background: #dc2626; color: #fff; }
+    .btn-danger:hover { background: #b91c1c; }
     
-    .table-container {{
+    .table-container {
       overflow-x: auto; max-height: 480px; overflow-y: auto; border: 1px solid var(--card-border);
       border-radius: 8px; background: #0b1120; margin-top: 12px;
-    }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 12px; text-align: left; }}
-    th {{ background: #1e293b; padding: 10px 12px; position: sticky; top: 0; color: #94a3b8; font-weight: 600; border-bottom: 1px solid var(--card-border); }}
-    td {{ padding: 8px 12px; border-bottom: 1px solid #1e293b; white-space: nowrap; }}
-    tr:hover {{ background: rgba(255,255,255,0.03); }}
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; text-align: left; }
+    th { background: #1e293b; padding: 10px 12px; position: sticky; top: 0; color: #94a3b8; font-weight: 600; border-bottom: 1px solid var(--card-border); }
+    td { padding: 8px 12px; border-bottom: 1px solid #1e293b; white-space: nowrap; }
+    tr:hover { background: rgba(255,255,255,0.03); }
     
-    .banner-alert {{
+    .banner-alert {
       padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 14px; display: none;
-    }}
-    .banner-success {{ background: rgba(16, 185, 129, 0.2); border: 1px solid var(--emerald); color: #a7f3d0; }}
-    .banner-error {{ background: rgba(239, 68, 68, 0.2); border: 1px solid var(--red); color: #fecaca; }}
+    }
+    .banner-success { background: rgba(16, 185, 129, 0.2); border: 1px solid var(--emerald); color: #a7f3d0; }
+    .banner-error { background: rgba(239, 68, 68, 0.2); border: 1px solid var(--red); color: #fecaca; }
   </style>
 </head>
 <body>
@@ -733,7 +733,7 @@ class ADSBLogger:
     <header>
       <div>
         <h1 style="font-size: 20px; font-weight: 700;">✈️ ADS-B Flight Logger & Control</h1>
-        <p style="font-size: 12px; color: var(--text-muted);">Webinterface auf Port {self.web_port} &bull; Raspberry Pi Daemon</p>
+        <p style="font-size: 12px; color: var(--text-muted);">Webinterface auf Port __WEB_PORT__ &bull; Raspberry Pi Daemon</p>
       </div>
       <div style="display: flex; gap: 10px; align-items: center;">
         <span class="badge" id="status-badge"><span class="pulse"></span> AKTIV & LOGGING</span>
@@ -845,20 +845,20 @@ class ADSBLogger:
   <script>
     let rawRows = [];
 
-    function showAlert(msg, isSuccess = true) {{
+    function showAlert(msg, isSuccess = true) {
       const el = document.getElementById('alert-box');
       el.textContent = msg;
       el.className = 'banner-alert ' + (isSuccess ? 'banner-success' : 'banner-error');
       el.style.display = 'block';
-      setTimeout(() => {{ el.style.display = 'none'; }}, 5000);
-    }}
+      setTimeout(() => { el.style.display = 'none'; }, 5000);
+    }
 
-    function setSource(val) {{
+    function setSource(val) {
       document.getElementById('cfg-source').value = val;
-    }}
+    }
 
-    async function loadStatus() {{
-      try {{
+    async function loadStatus() {
+      try {
         const res = await fetch('/api/status');
         const data = await res.json();
         
@@ -872,42 +872,42 @@ class ADSBLogger:
         document.getElementById('stat-cycle').textContent = 'Letzter Abruf: ' + (data.last_cycle_time || 'Noch keiner');
         document.getElementById('info-csv-path').textContent = data.csv_path;
 
-        if (!document.getElementById('cfg-source').value) {{
+        if (!document.getElementById('cfg-source').value) {
           document.getElementById('cfg-source').value = data.source;
-        }}
-        if (!document.getElementById('cfg-interval').value) {{
+        }
+        if (!document.getElementById('cfg-interval').value) {
           document.getElementById('cfg-interval').value = data.interval;
-        }}
+        }
 
         const errEl = document.getElementById('info-error');
-        if (data.last_error) {{
+        if (data.last_error) {
           errEl.textContent = '⚠️ Letzter Fehler: ' + data.last_error;
           errEl.style.display = 'block';
-        }} else {{
+        } else {
           errEl.style.display = 'none';
-        }}
-      }} catch (e) {{
+        }
+      } catch (e) {
         console.error("Status fetch error", e);
-      }}
-    }}
+      }
+    }
 
-    async function loadPreview() {{
-      try {{
+    async function loadPreview() {
+      try {
         const res = await fetch('/api/csv_preview?limit=100');
         const data = await res.json();
         rawRows = data.rows || [];
         renderTable(rawRows);
-      }} catch (e) {{
+      } catch (e) {
         console.error("Preview fetch error", e);
-      }}
-    }}
+      }
+    }
 
-    function renderTable(rows) {{
+    function renderTable(rows) {
       const tbody = document.getElementById('csv-tbody');
-      if (!rows || rows.length === 0) {{
+      if (!rows || rows.length === 0) {
         tbody.innerHTML = '<tr><td colspan="10" style="text-align: center; color: var(--text-muted); padding: 20px;">Noch keine Flüge geloggt.</td></tr>';
         return;
-      }}
+      }
       tbody.innerHTML = rows.map(r => 
         '<tr>' +
           '<td style="color: #94a3b8; font-family: monospace;">' + (r.first_seen_utc || '') + '</td>' +
@@ -922,14 +922,14 @@ class ADSBLogger:
           '<td style="color: #94a3b8;">' + (r.rssi_max ? r.rssi_max + ' dB' : '-') + '</td>' +
         '</tr>'
       ).join('');
-    }}
+    }
 
-    function filterTable() {{
+    function filterTable() {
       const q = document.getElementById('search-input').value.toLowerCase().trim();
-      if (!q) {{
+      if (!q) {
         renderTable(rawRows);
         return;
-      }}
+      }
       const filtered = rawRows.filter(r => 
         (r.callsign && r.callsign.toLowerCase().includes(q)) ||
         (r.icao_hex && r.icao_hex.toLowerCase().includes(q)) ||
@@ -938,41 +938,41 @@ class ADSBLogger:
         (r.registration && r.registration.toLowerCase().includes(q))
       );
       renderTable(filtered);
-    }}
+    }
 
-    async function saveConfig(e) {{
+    async function saveConfig(e) {
       e.preventDefault();
       const source = document.getElementById('cfg-source').value.trim();
       const interval = document.getElementById('cfg-interval').value;
-      try {{
-        const res = await fetch('/api/config', {{
+      try {
+        const res = await fetch('/api/config', {
           method: 'POST',
-          headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ source, interval }})
-        }});
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ source, interval })
+        });
         const data = await res.json();
-        if (data.success) {{
+        if (data.success) {
           showAlert(data.message, true);
           loadStatus();
-        }} else {{
+        } else {
           showAlert(data.error || 'Fehler beim Speichern', false);
-        }}
-      }} catch (err) {{
+        }
+      } catch (err) {
         showAlert('Verbindungsfehler zum Server', false);
-      }}
-    }}
+      }
+    }
 
-    async function restartTracker() {{
+    async function restartTracker() {
       if (!confirm('Möchtest du den Flug-Tracker wirklich zurücksetzen? (Laufende Überflüge werden neu synchronisiert)')) return;
-      try {{
-        const res = await fetch('/api/restart', {{ method: 'POST' }});
+      try {
+        const res = await fetch('/api/restart', { method: 'POST' });
         const data = await res.json();
         showAlert(data.message || 'Neu gestartet', true);
-        setTimeout(() => {{ loadStatus(); loadPreview(); }}, 1000);
-      }} catch (e) {{
+        setTimeout(() => { loadStatus(); loadPreview(); }, 1000);
+      } catch (e) {
         showAlert('Fehler beim Neustart', false);
-      }}
-    }}
+      }
+    }
 
     // Initial load & Polling
     loadStatus();
@@ -983,6 +983,7 @@ class ADSBLogger:
 </body>
 </html>
 """
+        return html.replace("__WEB_PORT__", str(self.web_port))
 
     def run(self):
         def _sig_handler(sig, frame):
