@@ -104,7 +104,7 @@ TARGET_SOURCE=""
 if [ "$VARIANT_CHOICE" = "2" ]; then
   echo ""
   echo -e "${CYAN}[Variante 2: Netzwerk-Quelle]${NC}"
-  prompt_user "Netzwerkpfad / URL zu aircraft.json [Standard: http://192.168.1.200/data/aircraft.json]: " "http://192.168.1.200/data/aircraft.json" TARGET_SOURCE
+  prompt_user "Netzwerkpfad / URL zu aircraft.json [Standard: http://192.168.1.200:8080/data/aircraft.json]: " "http://192.168.1.200:8080/data/aircraft.json" TARGET_SOURCE
   echo -e "${GREEN}[✓]${NC} Verwende Netzwerk-Quelle: ${YELLOW}$TARGET_SOURCE${NC}"
 else
   echo ""
