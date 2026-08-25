@@ -104,12 +104,17 @@ class ActiveFlight:
         self.rssi_max = self._parse_num(raw_ac.get("rssi"))
 
     def has_valid_callsign(self) -> bool:
-        cs = (self.callsign or "").strip().upper()
-        return bool(cs and cs not in ("NOCALL", "UNKNOWN", "UNAVAILABLE", "NONE"))
+        if not self.callsign:
+            return False
+        cs = self.callsign.strip().upper()
+        if cs in ("NOCALL", "UNKNOWN", "UNAVAILABLE", "NONE", "00000000", "TEST", "GROUND", "NO-REG", "N/A"):
+            return False
+        clean_chars = "".join(c for c in cs if c.isalnum())
+        return len(clean_chars) >= 2
 
     def update(self, raw_ac: Dict[str, Any], current_time: float):
         self.last_seen_ts = current_time
-        cs = (raw_ac.get("flight") or raw_ac.get("callsign") or "").strip()
+        cs = (raw_ac.get("flight") or raw_ac.get("callsign") or raw_ac.get("flight_number") or "").strip()
         if cs and (not self.callsign or self.callsign in ("UNKNOWN", "NOCALL")):
             self.callsign = cs
             
@@ -176,32 +181,91 @@ class ActiveFlight:
         if rssi is not None and (self.rssi_max is None or rssi > self.rssi_max):
             self.rssi_max = rssi
 
-    def query_adsbdb(self):
-        """Fragt die ADSBDB API ab, sobald eine gültige Flugnummer vorliegt."""
-        if self.adsbdb_queried or not self.has_valid_callsign():
+    def query_adsbdb(self, sync: bool = False, timeout: float = 2.5):
+        """
+        Ermittelt Flugdaten (Start, Ziel, Route, Flugzeug-Registrierung, Modell)
+        über die API von adsbdb.com anhand des Mode-S Hex oder der Registration:
+        https://api.adsbdb.com/v0/aircraft/{MODE_S || REGISTRATION}?callsign={CALLSIGN_ICAO}
+        """
+        if self.adsbdb_queried:
             return
         
+        # Identifikator bestimmen: Mode-S Hex (bevorzugt) oder Registration
+        ident = (self.hex or "").strip().upper()
+        if not ident and self.registration:
+            ident = self.registration.strip().upper()
+        if not ident:
+            return
+
         self.adsbdb_queried = True
-        try:
-            url = f"https://api.adsbdb.com/v0/callsign/{urllib.parse.quote(self.callsign.upper())}"
-            req = urllib.request.Request(url, headers={"User-Agent": "ADSB-Logger/1.0"})
-            with urllib.request.urlopen(req, timeout=3.0) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                fr = data.get("response", {}).get("flightroute", {})
-                if fr:
-                    orig = fr.get("origin", {}).get("iata_code") or fr.get("origin", {}).get("icao_code") or fr.get("origin", {}).get("municipality") or ""
-                    dest = fr.get("destination", {}).get("iata_code") or fr.get("destination", {}).get("icao_code") or fr.get("destination", {}).get("municipality") or ""
-                    airline = fr.get("airline", {}).get("name") or ""
-                    self.origin = orig
-                    self.destination = dest
-                    self.airline = airline
-                    if orig and dest:
-                        self.route = f"{orig} -> {dest}"
-                        if airline: self.route += f" ({airline})"
-                    elif airline:
-                        self.route = airline
-        except Exception:
-            pass
+
+        def _do_fetch():
+            try:
+                # 1. Hauptabfrage: /v0/aircraft/{MODE_S || REGISTRATION}?callsign={CALLSIGN}
+                url = f"https://api.adsbdb.com/v0/aircraft/{urllib.parse.quote(ident)}"
+                cs_clean = (self.callsign or "").strip().upper()
+                if self.has_valid_callsign():
+                    url += f"?callsign={urllib.parse.quote(cs_clean)}"
+                
+                req = urllib.request.Request(url, headers={"User-Agent": "ADSB-Logger/1.0 (Raspberry Pi Tracker)"})
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    resp_obj = data.get("response", {})
+                    
+                    # Flugzeug-Stammdaten übernehmen (falls noch leer)
+                    ac_info = resp_obj.get("aircraft", {})
+                    if ac_info:
+                        if not self.registration and ac_info.get("registration"):
+                            self.registration = ac_info.get("registration")
+                        if not self.type_code and ac_info.get("icao_type"):
+                            self.type_code = ac_info.get("icao_type")
+                        if not self.aircraft_desc and ac_info.get("type"):
+                            self.aircraft_desc = ac_info.get("type")
+                        if not self.airline and ac_info.get("registered_owner"):
+                            self.airline = ac_info.get("registered_owner")
+
+                    # Routen- und Flughafendaten übernehmen (Start/Ziel)
+                    fr = resp_obj.get("flightroute", {})
+                    if fr:
+                        orig = fr.get("origin", {}).get("iata_code") or fr.get("origin", {}).get("icao_code") or fr.get("origin", {}).get("municipality") or ""
+                        dest = fr.get("destination", {}).get("iata_code") or fr.get("destination", {}).get("icao_code") or fr.get("destination", {}).get("municipality") or ""
+                        al_name = fr.get("airline", {}).get("name") or ""
+                        if orig: self.origin = orig
+                        if dest: self.destination = dest
+                        if al_name and not self.airline: self.airline = al_name
+                        if orig and dest:
+                            self.route = f"{orig} -> {dest}"
+                            if al_name: self.route += f" ({al_name})"
+                        elif al_name and not self.route:
+                            self.route = al_name
+
+                # 2. Fallback: Falls keine Route geliefert wurde, aber ein Rufzeichen vorliegt: /v0/callsign/{CALLSIGN}
+                if (not self.origin or not self.destination) and self.has_valid_callsign():
+                    cs_url = f"https://api.adsbdb.com/v0/callsign/{urllib.parse.quote(cs_clean)}"
+                    cs_req = urllib.request.Request(cs_url, headers={"User-Agent": "ADSB-Logger/1.0 (Raspberry Pi Tracker)"})
+                    with urllib.request.urlopen(cs_req, timeout=timeout) as cs_resp:
+                        cs_data = json.loads(cs_resp.read().decode("utf-8"))
+                        cs_fr = cs_data.get("response", {}).get("flightroute", {})
+                        if cs_fr:
+                            orig = cs_fr.get("origin", {}).get("iata_code") or cs_fr.get("origin", {}).get("icao_code") or cs_fr.get("origin", {}).get("municipality") or ""
+                            dest = cs_fr.get("destination", {}).get("iata_code") or cs_fr.get("destination", {}).get("icao_code") or cs_fr.get("destination", {}).get("municipality") or ""
+                            al_name = cs_fr.get("airline", {}).get("name") or ""
+                            if orig: self.origin = orig
+                            if dest: self.destination = dest
+                            if al_name and not self.airline: self.airline = al_name
+                            if orig and dest:
+                                self.route = f"{orig} -> {dest}"
+                                if al_name: self.route += f" ({al_name})"
+                            elif al_name and not self.route:
+                                self.route = al_name
+            except Exception:
+                pass
+
+        if sync:
+            _do_fetch()
+        else:
+            t = threading.Thread(target=_do_fetch, daemon=True)
+            t.start()
 
     def get_flight_uid(self, mode: str = "daily") -> str:
         cs = self.callsign.strip().upper() if self.has_valid_callsign() else "NOCALL"
@@ -476,49 +540,64 @@ class ADSBLogger:
         with self.lock:
             for ac in (data.get("aircraft") or data.get("ac") or []):
                 hex_id = (ac.get("hex") or "").strip().lower()
-                if not hex_id: continue
+                if not hex_id:
+                    continue
                 
                 if hex_id in self.active_flights:
                     flight = self.active_flights[hex_id]
                     flight.update(ac, now)
-                    
-                    if flight.has_valid_callsign() and not flight.adsbdb_queried and self.enable_adsbdb:
-                        flight.query_adsbdb()
                 else:
                     flight = ActiveFlight(hex_id, now, ac)
                     self.active_flights[hex_id] = flight
-                    
-                    if flight.has_valid_callsign() and self.enable_adsbdb:
-                        flight.query_adsbdb()
-                        
-                    if self.immediate and flight.has_valid_callsign():
-                        uid = flight.get_flight_uid(self.dedup_mode)
-                        if uid not in self.logged_uids:
-                            self._write(flight, uid)
-                            self.logged_uids.add(uid)
+                
+                # Wenn Rufzeichen vorhanden ist: ADSBDB abfragen & sofort in CSV loggen
+                if flight.has_valid_callsign():
+                    uid = flight.get_flight_uid(self.dedup_mode)
+                    if uid not in self.logged_uids:
+                        if not flight.adsbdb_queried and self.enable_adsbdb:
+                            flight.query_adsbdb(sync=True, timeout=2.0)
+                        self._write(flight, uid)
+                        self.logged_uids.add(uid)
+                    elif not flight.adsbdb_queried and self.enable_adsbdb:
+                        flight.query_adsbdb(sync=False)
 
-            # Abgelaufene Flüge prüfen
+            # Abgelaufene Flüge (Timeout nach Verlassen des Empfangsbereichs)
             expired = [h for h, f in self.active_flights.items() if now - f.last_seen_ts > self.timeout_gap]
             for hex_id in expired:
                 flight = self.active_flights.pop(hex_id)
-                if not flight.has_valid_callsign():
-                    continue
-                    
+                # Falls ein Flug ohne offizielles Rufzeichen bisher nicht geloggt wurde (z.B. VFR/Segelflug)
                 uid = flight.get_flight_uid(self.dedup_mode)
-                if uid not in self.logged_uids:
+                if uid not in self.logged_uids and flight.hex:
+                    if not flight.adsbdb_queried and self.enable_adsbdb:
+                        flight.query_adsbdb(sync=True, timeout=2.0)
                     self._write(flight, uid)
                     self.logged_uids.add(uid)
-                    print(f"\n[GELOGGT] {flight.hex.upper()} | {flight.callsign} | {flight.route or 'OK'} -> CSV [{uid}]")
 
     def _write(self, flight: ActiveFlight, uid: str):
         try:
+            parent_dir = os.path.dirname(self.csv_path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+            
+            file_exists = os.path.isfile(self.csv_path) and os.path.getsize(self.csv_path) > 0
             with open(self.csv_path, mode="a", encoding="utf-8", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+                if not file_exists:
+                    writer.writeheader()
                 writer.writerow(flight.to_csv_dict(uid))
                 f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+            self.last_error = None
+            cs_display = flight.callsign or flight.hex.upper()
+            route_display = flight.route or (flight.airline if flight.airline else "-")
+            print(f"\n[GELOGGT] {flight.hex.upper()} | {cs_display:<8} | Route: {route_display:<20} -> CSV ({os.path.basename(self.csv_path)})", flush=True)
         except Exception as e:
-            self.last_error = f"CSV-Schreibfehler: {e}"
-            print(f"[FEHLER] CSV-Schreibfehler: {e}", file=sys.stderr)
+            err_str = f"CSV-Schreibfehler ({self.csv_path}): {e}"
+            self.last_error = err_str
+            print(f"\n[FEHLER] {err_str}", file=sys.stderr, flush=True)
 
     def get_status_dict(self) -> Dict[str, Any]:
         with self.lock:

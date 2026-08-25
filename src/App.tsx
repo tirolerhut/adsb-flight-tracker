@@ -216,14 +216,17 @@ export default function App() {
                 // Newly acquired callsign -> Trigger ADSBDB route lookup
                 if (!existing.adsbdbQueried) {
                   existing.adsbdbQueried = true;
-                  fetchAdsbdbRoute(callsign).then(routeInfo => {
+                  fetchAdsbdbRoute(callsign, hex, existing.registration || ac.r).then(routeInfo => {
                     if (routeInfo) {
                       setFlightRecords(curr => curr.map(f => f.uid === uid ? {
                         ...f,
                         adsbdbRoute: routeInfo.route,
                         adsbdbOrigin: routeInfo.origin,
                         adsbdbDestination: routeInfo.destination,
-                        adsbdbAirline: routeInfo.airline
+                        adsbdbAirline: routeInfo.airline,
+                        registration: f.registration || routeInfo.registration || '',
+                        typeCode: f.typeCode || routeInfo.typeCode || '',
+                        aircraftDesc: f.aircraftDesc || routeInfo.aircraftDesc || ''
                       } : f));
                     }
                   });
@@ -309,14 +312,17 @@ export default function App() {
               recordMap.set(uid, newRecord);
 
               if (callsign && callsign !== 'NOCALL' && callsign !== 'UNKNOWN') {
-                fetchAdsbdbRoute(callsign).then(routeInfo => {
+                fetchAdsbdbRoute(callsign, hex, ac.r).then(routeInfo => {
                   if (routeInfo) {
                     setFlightRecords(curr => curr.map(f => f.uid === uid ? {
                       ...f,
                       adsbdbRoute: routeInfo.route,
                       adsbdbOrigin: routeInfo.origin,
                       adsbdbDestination: routeInfo.destination,
-                      adsbdbAirline: routeInfo.airline
+                      adsbdbAirline: routeInfo.airline,
+                      registration: f.registration || routeInfo.registration || '',
+                      typeCode: f.typeCode || routeInfo.typeCode || '',
+                      aircraftDesc: f.aircraftDesc || routeInfo.aircraftDesc || ''
                     } : f));
                   }
                 });
