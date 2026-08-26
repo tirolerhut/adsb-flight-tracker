@@ -16,8 +16,8 @@ export const PythonStudio: React.FC = () => {
   const [githubBranch, setGithubBranch] = useState('main');
 
   // Customizer state
-  const [sourceType, setSourceType] = useState<'local' | 'url'>('local');
-  const [sourcePath, setSourcePath] = useState('/run/readsb/aircraft.json');
+  const [sourceType, setSourceType] = useState<'local' | 'url'>('url');
+  const [sourcePath, setSourcePath] = useState('https://opendata.adsb.fi/api/v3/lat/47.259665/lon/11.3431121/dist/25');
   const [outputPath, setOutputPath] = useState('flights.csv');
   const [interval, setInterval] = useState(5);
   const [timeout, setTimeoutVal] = useState(300);
@@ -202,6 +202,13 @@ export const PythonStudio: React.FC = () => {
             <div className="flex gap-1 mb-1.5 flex-wrap">
               <button
                 type="button"
+                onClick={() => { setSourceType('url'); setSourcePath('https://opendata.adsb.fi/api/v3/lat/47.259665/lon/11.3431121/dist/25'); }}
+                className={`px-2 py-0.5 rounded text-[11px] font-medium transition-colors ${sourcePath.includes('adsb.fi') ? 'bg-indigo-600 text-white shadow-2xs font-semibold' : 'bg-slate-100 text-slate-600 hover:text-slate-900'}`}
+              >
+                📍 Innsbruck 25 NM (adsb.fi)
+              </button>
+              <button
+                type="button"
                 onClick={() => { setSourceType('local'); setSourcePath('/run/readsb/aircraft.json'); }}
                 className={`px-2 py-0.5 rounded text-[11px] font-medium transition-colors ${sourcePath === '/run/readsb/aircraft.json' ? 'bg-indigo-600 text-white shadow-2xs' : 'bg-slate-100 text-slate-600 hover:text-slate-900'}`}
               >
@@ -219,7 +226,7 @@ export const PythonStudio: React.FC = () => {
                 onClick={() => { setSourceType('url'); setSourcePath('http://192.168.1.200/data/aircraft.json'); }}
                 className={`px-2 py-0.5 rounded text-[11px] font-medium transition-colors ${sourcePath === 'http://192.168.1.200/data/aircraft.json' ? 'bg-indigo-600 text-white shadow-2xs' : 'bg-slate-100 text-slate-600 hover:text-slate-900'}`}
               >
-                LAN-URL (Variante 2)
+                LAN-URL
               </button>
             </div>
             <input
@@ -544,13 +551,17 @@ export const PythonStudio: React.FC = () => {
           </div>
 
           <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-5 text-xs space-y-2 font-mono text-slate-700 shadow-xs">
-            <p className="text-slate-800 font-sans font-bold">Manuelle Steuerung auf dem Raspberry Pi:</p>
+            <p className="text-slate-800 font-sans font-bold">Dienst- & Update-Befehle auf dem Raspberry Pi:</p>
             <div className="bg-slate-950 p-3 rounded-lg border border-slate-800 space-y-1.5 text-emerald-400">
+              <p className="text-amber-400">sudo update-adsb-logger              # Stoppt Dienst, aktualisiert Skript &amp; startet neu</p>
               <p>sudo systemctl status {serviceName}.service     # Status prüfen</p>
               <p>sudo journalctl -u {serviceName}.service -f     # Live-Logs anzeigen</p>
               <p>sudo systemctl restart {serviceName}.service    # Dienst neu starten</p>
               <p>sudo systemctl stop {serviceName}.service       # Dienst stoppen</p>
             </div>
+            <p className="text-slate-500 font-sans text-[11px] pt-1">
+              ✓ <strong>Sicheres Update garantiert:</strong> Sowohl der Installer als auch das Web-Update halten den aktiven Dienst vor dem Überschreiben der Skriptdatei automatisch an und führen eine atomare Aktualisierung mit Syntax-Prüfung durch.
+            </p>
           </div>
         </div>
       )}
@@ -576,6 +587,10 @@ export const PythonStudio: React.FC = () => {
               <li className="bg-slate-50 p-2.5 rounded-lg border border-slate-200">
                 <span className="font-semibold block text-slate-900">4. CSV-Einträge verfolgen</span>
                 <span className="text-slate-500 font-mono text-[11px]">tail -f ~/adsb-data/flights.csv</span>
+              </li>
+              <li className="bg-slate-50 p-2.5 rounded-lg border border-slate-200">
+                <span className="font-semibold block text-slate-900">5. Sicheres Skript-Update</span>
+                <span className="text-slate-500 font-mono text-[11px]">sudo update-adsb-logger <span className="text-slate-400 font-sans">(oder im Web-Dashboard)</span></span>
               </li>
             </ol>
           </div>

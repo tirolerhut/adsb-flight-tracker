@@ -4,11 +4,15 @@
 =============================================================================
 ADS-B Flight Logger & Web Control Dashboard (Port 7001)
 =============================================================================
-Dieses Skript überwacht fortlaufend die Datei 'aircraft.json' eines ADS-B Empfängers
-(z. B. dump1090, readsb, tar1090, PiAware, FlightAware, RTL-SDR oder LAN-URL).
+Dieses Skript überwacht fortlaufend Flugzeuge über dem Flughafen Innsbruck (LOWI)
+im Umkreis von 25 nautischen Meilen über die REST-API von adsb.fi:
+https://opendata.adsb.fi/api/v3/lat/47.259665/lon/11.3431121/dist/25
+
+Alternativ kann jede andere HTTP-API oder lokale 'aircraft.json' Datei
+(z. B. dump1090, readsb, tar1090, PiAware, RTL-SDR) angegeben werden.
 
 Hauptfunktionen:
-1. Kontinuierliches Polling von lokaler Datei (/run/readsb/aircraft.json) oder HTTP-URL.
+1. Kontinuierliches Polling der Innsbruck 25 NM Point-API (oder lokaler aircraft.json).
 2. Intelligente Flugerkennung & Deduplizierung:
    - Jeder Flug wird anhand von ICAO-Hex, Rufzeichen (Callsign) und Flug-Session/Datum
      genau EINMAL in die CSV-Datei geschrieben.
@@ -21,7 +25,7 @@ Hauptfunktionen:
    - Live-Einstellung von Quelle (URL/Pfad) und Polling-Intervall ohne SSH
    - Neustart-Button zur Re-Initialisierung des Trackers
    - Live-Statusfenster mit Inhalt & Suche der CSV-Flugdaten
-   - Direkter CSV-Download über das Webinterface
+   - Direkter CSV-Download & HTTP-Stream (/flights.csv) über das Webinterface
 =============================================================================
 """
 
@@ -43,9 +47,15 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from typing import Dict, Any, Optional, Set, List
 
-SCRIPT_VERSION = "2.5.0"
+SCRIPT_VERSION = "2.6.0"
 DEFAULT_GITHUB_REPO = "tirolerhut/adsb-flight-tracker"
 DEFAULT_GITHUB_BRANCH = "main"
+
+# Standard-Quelle: Flughafen Innsbruck (LOWI) im 25 NM Radius über opendata.adsb.fi
+DEFAULT_SOURCE = "https://opendata.adsb.fi/api/v3/lat/47.259665/lon/11.3431121/dist/25"
+INNSBRUCK_LAT = 47.259665
+INNSBRUCK_LON = 11.3431121
+INNSBRUCK_RADIUS_NM = 25.0
 
 # Standard CSV-Spalten
 CSV_FIELDNAMES = [
@@ -598,7 +608,7 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
 
 
 class ADSBLogger:
-    def __init__(self, source: str, csv_path: str, interval: float, timeout_gap: float, dedup_mode: str, immediate: bool, query_adsbdb: bool = True, web_port: int = 7001):
+    def __init__(self, source: str = DEFAULT_SOURCE, csv_path: str = "flights.csv", interval: float = 5.0, timeout_gap: float = 300.0, dedup_mode: str = "daily", immediate: bool = False, query_adsbdb: bool = True, web_port: int = 7001):
         self.source = source
         self.csv_path = os.path.abspath(csv_path)
         self.interval = max(0.5, interval)
@@ -660,14 +670,17 @@ class ADSBLogger:
     def fetch_data(self) -> Optional[Dict[str, Any]]:
         src = self.source
         if src.startswith("http://") or src.startswith("https://"):
-            req = urllib.request.Request(src, headers={"User-Agent": "ADSB-Logger/1.0"})
+            req = urllib.request.Request(src, headers={
+                "User-Agent": f"ADSB-Innsbruck-Logger/{SCRIPT_VERSION} (LOWI 25NM Point Tracker; +https://opendata.adsb.fi)",
+                "Accept": "application/json"
+            })
             try:
-                with urllib.request.urlopen(req, timeout=4.0) as resp:
+                with urllib.request.urlopen(req, timeout=6.0) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                     self.last_error = None
                     return data
             except Exception as e:
-                self.last_error = f"HTTP-Fehler ({src}): {e}"
+                self.last_error = f"API/HTTP-Fehler ({src}): {e}"
                 return None
         else:
             if not os.path.exists(src):
@@ -812,6 +825,7 @@ class ADSBLogger:
 
         script_path = self.get_script_path()
         backup_path = self.get_backup_path()
+        tmp_path = script_path + ".tmp"
 
         # Backup erstellen
         if os.path.exists(script_path):
@@ -820,11 +834,16 @@ class ADSBLogger:
                     cur_code = cur_f.read()
                 with open(backup_path, "w", encoding="utf-8") as bak_f:
                     bak_f.write(cur_code)
+                    bak_f.flush()
+                    try:
+                        os.fsync(bak_f.fileno())
+                    except Exception:
+                        pass
             except Exception as e:
                 print(f"[UPDATE WARNUNG] Backup konnte nicht gespeichert werden: {e}")
 
-        # Neue Datei schreiben
-        with open(script_path, "w", encoding="utf-8") as f:
+        # Neue Datei zunächst sicher in temporäre Datei schreiben
+        with open(tmp_path, "w", encoding="utf-8") as f:
             f.write(new_code)
             f.flush()
             try:
@@ -833,9 +852,12 @@ class ADSBLogger:
                 pass
 
         try:
-            os.chmod(script_path, 0o755)
+            os.chmod(tmp_path, 0o755)
         except Exception:
             pass
+
+        # Atomarer Austausch der Datei (verhindert unvollständiges Schreiben/Sperren)
+        os.replace(tmp_path, script_path)
 
         remote_ver = "unknown"
         for line in new_code.splitlines()[:60]:
@@ -847,9 +869,11 @@ class ADSBLogger:
 
         if restart:
             def _restart_worker():
-                time.sleep(1.2)
+                time.sleep(1.0)
+                print("[UPDATE] Halte Dienst/Logger für sicheren Neustart an...")
+                self.running = False
                 try:
-                    res = os.system("systemctl restart adsb-logger 2>/dev/null")
+                    res = os.system("systemctl restart adsb-logger 2>/dev/null || (systemctl stop adsb-logger 2>/dev/null && sleep 1 && systemctl start adsb-logger 2>/dev/null)")
                     if res == 0:
                         return
                 except Exception:
@@ -864,7 +888,7 @@ class ADSBLogger:
 
         return {
             "success": True,
-            "message": f"Skript erfolgreich auf Version {remote_ver} aktualisiert! Dienst wird in 1-2 Sekunden neu gestartet.",
+            "message": f"Skript erfolgreich auf Version {remote_ver} aktualisiert! Dienst wird jetzt sauber neu gestartet.",
             "version": remote_ver,
             "script_path": script_path,
             "backup_path": backup_path,
@@ -874,6 +898,7 @@ class ADSBLogger:
     def rollback_backup(self, restart: bool = True) -> Dict[str, Any]:
         script_path = self.get_script_path()
         backup_path = self.get_backup_path()
+        tmp_path = script_path + ".tmp"
 
         if not os.path.exists(backup_path):
             raise FileNotFoundError("Keine Backup-Datei (.bak) vorhanden.")
@@ -883,14 +908,30 @@ class ADSBLogger:
 
         compile(bak_code, "adsb_logger_rollback.py", "exec")
 
-        with open(script_path, "w", encoding="utf-8") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             f.write(bak_code)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+
+        try:
+            os.chmod(tmp_path, 0o755)
+        except Exception:
+            pass
+
+        os.replace(tmp_path, script_path)
 
         if restart:
             def _restart_worker():
-                time.sleep(1.2)
+                time.sleep(1.0)
+                print("[ROLLBACK] Halte Dienst/Logger für Neustart an...")
+                self.running = False
                 try:
-                    os.system("systemctl restart adsb-logger 2>/dev/null")
+                    res = os.system("systemctl restart adsb-logger 2>/dev/null || (systemctl stop adsb-logger 2>/dev/null && sleep 1 && systemctl start adsb-logger 2>/dev/null)")
+                    if res == 0:
+                        return
                 except Exception:
                     pass
                 try:
@@ -903,7 +944,7 @@ class ADSBLogger:
 
         return {
             "success": True,
-            "message": "Backup (.bak) erfolgreich wiederhergestellt! Dienst startet neu."
+            "message": "Backup (.bak) erfolgreich wiederhergestellt! Dienst wird sauber neu gestartet."
         }
 
     def get_status_dict(self) -> Dict[str, Any]:
@@ -1085,9 +1126,11 @@ class ADSBLogger:
         <h2 style="font-size: 15px; margin-bottom: 12px; font-weight: 600;">⚙️ Einstellungen & Steuerung</h2>
         <form id="config-form" onsubmit="saveConfig(event)">
           <div class="form-group">
-            <label for="cfg-source">ADS-B Quelle (aircraft.json URL oder Pfad)</label>
-            <input type="text" id="cfg-source" name="source" placeholder="http://192.168.1.200/data/aircraft.json oder /run/readsb/aircraft.json">
+            <label for="cfg-source">ADS-B Quelle (REST API-URL oder aircraft.json Pfad)</label>
+            <input type="text" id="cfg-source" name="source" placeholder="https://opendata.adsb.fi/api/v3/lat/47.259665/lon/11.3431121/dist/25">
             <div style="display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap;">
+              <button type="button" class="btn btn-secondary" style="font-size: 11px; padding: 3px 8px; color: #38bdf8;" onclick="setSource('https://opendata.adsb.fi/api/v3/lat/47.259665/lon/11.3431121/dist/25')">📍 Innsbruck 25 NM (adsb.fi)</button>
+              <button type="button" class="btn btn-secondary" style="font-size: 11px; padding: 3px 8px;" onclick="setSource('https://opendata.adsb.fi/api/v3/lat/47.259665/lon/11.3431121/dist/50')">📍 Innsbruck 50 NM (adsb.fi)</button>
               <button type="button" class="btn btn-secondary" style="font-size: 11px; padding: 3px 8px;" onclick="setSource('/run/readsb/aircraft.json')">readsb (Lokal)</button>
               <button type="button" class="btn btn-secondary" style="font-size: 11px; padding: 3px 8px;" onclick="setSource('http://192.168.1.200/data/aircraft.json')">LAN-IP (.200)</button>
             </div>
@@ -1607,9 +1650,66 @@ class ADSBLogger:
                         self.logged_uids.add(uid)
 
 
+def run_cli_update(repo: str = DEFAULT_GITHUB_REPO, branch: str = DEFAULT_GITHUB_BRANCH, service_name: str = "adsb-logger"):
+    print("=" * 60)
+    print("ADS-B Logger CLI Update & Dienst-Verwaltung")
+    print("=" * 60)
+    print(f"[1/4] Prüfe und stoppe laufenden Hintergrunddienst ({service_name}.service)...")
+    os.system(f"systemctl stop {service_name}.service 2>/dev/null || true")
+    os.system("pkill -f adsb_logger.py 2>/dev/null || true")
+    time.sleep(1)
+    
+    print(f"[2/4] Lade aktuelle adsb_logger.py von GitHub ({repo}@{branch})...")
+    url = f"https://raw.githubusercontent.com/{repo}/{branch}/adsb_logger.py"
+    req = urllib.request.Request(url, headers={"User-Agent": f"ADSB-Logger-CLI-Updater/{SCRIPT_VERSION}"})
+    try:
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            new_code = resp.read().decode("utf-8")
+        if "class ADSBLogger" not in new_code:
+            raise ValueError("Heruntergeladene Datei ist kein gültiges ADS-B Logger Skript.")
+        compile(new_code, "update_test.py", "exec")
+    except Exception as e:
+        print(f"[FEHLER] Herunterladen oder Syntax-Prüfung fehlgeschlagen: {e}")
+        print(f"Starte Dienst '{service_name}.service' wieder...")
+        os.system(f"systemctl start {service_name}.service 2>/dev/null || true")
+        sys.exit(1)
+
+    script_path = os.path.abspath(__file__)
+    tmp_path = script_path + ".tmp"
+    bak_path = script_path + ".bak"
+
+    # Backup anlegen
+    if os.path.exists(script_path):
+        try:
+            with open(script_path, "r", encoding="utf-8") as f_cur:
+                cur_code = f_cur.read()
+            with open(bak_path, "w", encoding="utf-8") as f_bak:
+                f_bak.write(cur_code)
+        except Exception:
+            pass
+
+    # Atomar schreiben
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(new_code)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+    os.chmod(tmp_path, 0o755)
+    os.replace(tmp_path, script_path)
+    print(f"[3/4] Skript sicher und atomar aktualisiert ({len(new_code)} Bytes)")
+
+    print(f"[4/4] Starte Hintergrunddienst ({service_name}.service) neu...")
+    os.system(f"systemctl start {service_name}.service 2>/dev/null || true")
+    time.sleep(1)
+    os.system(f"systemctl is-active --quiet {service_name}.service && echo '[✓] Dienst ist aktiv und läuft!' || echo '[!] Bitte Status mit sudo systemctl status {service_name}.service prüfen.'")
+    print("=" * 60)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="ADS-B aircraft.json Logger & Web Dashboard")
-    parser.add_argument("--source", "-s", default="/run/readsb/aircraft.json", help="Pfad oder HTTP-URL zur aircraft.json")
+    parser = argparse.ArgumentParser(description="ADS-B Flugzeug-Logger (Airport Innsbruck 25 NM API via adsb.fi) & Web Dashboard")
+    parser.add_argument("--source", "-s", default=DEFAULT_SOURCE, help=f"API-URL (z. B. opendata.adsb.fi API) oder Dateipfad zur aircraft.json (Standard: {DEFAULT_SOURCE})")
     parser.add_argument("--output", "-o", default="flights.csv", help="CSV-Ausgabedatei")
     parser.add_argument("--interval", "-i", type=float, default=5.0, help="Polling-Intervall in Sek")
     parser.add_argument("--timeout", "-t", type=float, default=300.0, help="Inaktivitäts-Timeout in Sek")
@@ -1617,7 +1717,15 @@ def main():
     parser.add_argument("--immediate", action="store_true", help="Sofort bei Erhalt der Flugnummer loggen")
     parser.add_argument("--port", "-p", type=int, default=7001, help="Port für das integrierte Webinterface (Standard: 7001)")
     parser.add_argument("--no-adsbdb", action="store_true", help="ADSBDB Online-Routenabfrage deaktivieren")
+    parser.add_argument("--update", action="store_true", help="Stoppt den Dienst, lädt die neueste Skript-Version von GitHub herunter und startet den Dienst neu")
+    parser.add_argument("--github-repo", default=DEFAULT_GITHUB_REPO, help="GitHub Repository für Updates")
+    parser.add_argument("--github-branch", default=DEFAULT_GITHUB_BRANCH, help="GitHub Branch für Updates")
+    parser.add_argument("--service-name", default="adsb-logger", help="Name des systemd-Dienstes")
     args = parser.parse_args()
+
+    if args.update:
+        run_cli_update(repo=args.github_repo, branch=args.github_branch, service_name=args.service_name)
+        return
 
     logger = ADSBLogger(
         source=args.source,

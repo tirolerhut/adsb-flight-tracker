@@ -37,6 +37,8 @@ export interface RawAircraft {
   seen_pos?: number;
   r_dst?: number; // distance to receiver (NM)
   r_dir?: number; // bearing from receiver (deg)
+  dst?: number;   // distance to point center in NM (api.adsb.lol)
+  dir?: number;   // bearing from point center in deg (api.adsb.lol)
   version?: number;
   nic_baro?: number;
   nac_p?: number;

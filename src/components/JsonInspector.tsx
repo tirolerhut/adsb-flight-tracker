@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
 import { RawAircraft, AircraftJsonPayload } from '../types';
-import { Upload, FileCode, CheckCircle2, AlertCircle, Play, Sparkles, Copy, Check } from 'lucide-react';
+import { Upload, FileCode, CheckCircle2, AlertCircle, Play, Sparkles, Copy, Check, Radio, Loader2 } from 'lucide-react';
 import { INITIAL_SAMPLE_AIRCRAFT } from '../data/sampleAircraft';
+import { DEFAULT_ADSB_FI_URL, fetchLiveAdsbFi } from '../utils/adsbLolApi';
 
 interface JsonInspectorProps {
   currentPayload: AircraftJsonPayload | null;
@@ -16,6 +17,32 @@ export const JsonInspector: React.FC<JsonInspectorProps> = ({
   const [parseError, setParseError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [isLoadingApi, setIsLoadingApi] = useState(false);
+
+  const handleFetchLiveApi = async () => {
+    setIsLoadingApi(true);
+    setParseError(null);
+    setSuccessMsg(null);
+    try {
+      const res = await fetchLiveAdsbFi(DEFAULT_ADSB_FI_URL);
+      if (res.success && res.aircraft.length > 0) {
+        const formatted = JSON.stringify(res.payload, null, 2);
+        setJsonText(formatted);
+        onLoadCustomAircraft(res.aircraft, 'opendata.adsb.fi (Innsbruck 25 NM)');
+        setSuccessMsg(`Live-Daten von opendata.adsb.fi geladen: ${res.aircraft.length} aktive Flugzeuge über Innsbruck!`);
+      } else if (res.success && res.aircraft.length === 0) {
+        const formatted = JSON.stringify(res.payload, null, 2);
+        setJsonText(formatted);
+        setSuccessMsg('API-Abfrage erfolgreich, aktuell befinden sich 0 Flugzeuge im 25 NM Radius um LOWI.');
+      } else {
+        setParseError(res.error || 'Fehler beim Abrufen der adsb.fi Live-API.');
+      }
+    } catch (err: any) {
+      setParseError(`Netzwerkfehler: ${err.message}`);
+    } finally {
+      setIsLoadingApi(false);
+    }
+  };
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -92,7 +119,20 @@ export const JsonInspector: React.FC<JsonInspectorProps> = ({
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <button
+            onClick={handleFetchLiveApi}
+            disabled={isLoadingApi}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 transition-all shadow-2xs cursor-pointer disabled:opacity-50"
+          >
+            {isLoadingApi ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-indigo-600" />
+            ) : (
+              <Radio className="w-3.5 h-3.5 text-indigo-600" />
+            )}
+            <span>Live Innsbruck API (adsb.fi)</span>
+          </button>
+
           <button
             onClick={handleLoadSample}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 transition-all shadow-2xs cursor-pointer"

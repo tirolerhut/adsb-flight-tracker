@@ -1,6 +1,6 @@
 {
   "name": "ADS-B Flight Logger",
-  "description": "Analysiert aircraft.json von ADS-B Empfängern (dump1090, readsb), dedupliziert Flüge und speichert sie fortlaufend in CSV.",
+  "description": "Erfasst Flugbewegungen über Innsbruck (LOWI 25 NM API via opendata.adsb.fi) und lokalen ADS-B Empfängern (readsb/dump1090), dedupliziert Flüge und speichert sie in CSV mit HTTP-Stream-Schnittstelle.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

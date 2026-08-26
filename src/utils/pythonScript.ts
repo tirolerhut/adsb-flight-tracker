@@ -4,11 +4,15 @@ export const PYTHON_SCRIPT_CODE = `#!/usr/bin/env python3
 =============================================================================
 ADS-B Flight Logger & Web Control Dashboard (Port 7001)
 =============================================================================
-Dieses Skript überwacht fortlaufend die Datei 'aircraft.json' eines ADS-B Empfängers
-(z. B. dump1090, readsb, tar1090, PiAware, FlightAware, RTL-SDR oder LAN-URL).
+Dieses Skript überwacht fortlaufend Flugzeuge über dem Flughafen Innsbruck (LOWI)
+im Umkreis von 25 nautischen Meilen über die REST-API von adsb.fi:
+https://opendata.adsb.fi/api/v3/lat/47.259665/lon/11.3431121/dist/25
+
+Alternativ kann jede andere HTTP-API oder lokale 'aircraft.json' Datei
+(z. B. dump1090, readsb, tar1090, PiAware, RTL-SDR) angegeben werden.
 
 Hauptfunktionen:
-1. Kontinuierliches Polling von lokaler Datei (/run/readsb/aircraft.json) oder HTTP-URL.
+1. Kontinuierliches Polling der Innsbruck 25 NM Point-API (oder lokaler aircraft.json).
 2. Intelligente Flugerkennung & Deduplizierung:
    - Jeder Flug wird anhand von ICAO-Hex, Rufzeichen (Callsign) und Flug-Session/Datum
      genau EINMAL in die CSV-Datei geschrieben.
@@ -21,7 +25,7 @@ Hauptfunktionen:
    - Live-Einstellung von Quelle (URL/Pfad) und Polling-Intervall ohne SSH
    - Neustart-Button zur Re-Initialisierung des Trackers
    - Live-Statusfenster mit Inhalt & Suche der CSV-Flugdaten
-   - Direkter CSV-Download über das Webinterface
+   - Direkter CSV-Download & HTTP-Stream (/flights.csv) über das Webinterface
 =============================================================================
 """
 
@@ -43,9 +47,15 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from typing import Dict, Any, Optional, Set, List
 
-SCRIPT_VERSION = "2.5.0"
+SCRIPT_VERSION = "2.6.0"
 DEFAULT_GITHUB_REPO = "tirolerhut/adsb-flight-tracker"
 DEFAULT_GITHUB_BRANCH = "main"
+
+# Standard-Quelle: Flughafen Innsbruck (LOWI) im 25 NM Radius über opendata.adsb.fi
+DEFAULT_SOURCE = "https://opendata.adsb.fi/api/v3/lat/47.259665/lon/11.3431121/dist/25"
+INNSBRUCK_LAT = 47.259665
+INNSBRUCK_LON = 11.3431121
+INNSBRUCK_RADIUS_NM = 25.0
 
 # Standard CSV-Spalten
 CSV_FIELDNAMES = [
@@ -598,7 +608,7 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
 
 
 class ADSBLogger:
-    def __init__(self, source: str, csv_path: str, interval: float, timeout_gap: float, dedup_mode: str, immediate: bool, query_adsbdb: bool = True, web_port: int = 7001):
+    def __init__(self, source: str = DEFAULT_SOURCE, csv_path: str = "flights.csv", interval: float = 5.0, timeout_gap: float = 300.0, dedup_mode: str = "daily", immediate: bool = False, query_adsbdb: bool = True, web_port: int = 7001):
         self.source = source
         self.csv_path = os.path.abspath(csv_path)
         self.interval = max(0.5, interval)
@@ -660,14 +670,17 @@ class ADSBLogger:
     def fetch_data(self) -> Optional[Dict[str, Any]]:
         src = self.source
         if src.startswith("http://") or src.startswith("https://"):
-            req = urllib.request.Request(src, headers={"User-Agent": "ADSB-Logger/1.0"})
+            req = urllib.request.Request(src, headers={
+                "User-Agent": f"ADSB-Innsbruck-Logger/{SCRIPT_VERSION} (LOWI 25NM Point Tracker; +https://opendata.adsb.fi)",
+                "Accept": "application/json"
+            })
             try:
-                with urllib.request.urlopen(req, timeout=4.0) as resp:
+                with urllib.request.urlopen(req, timeout=6.0) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                     self.last_error = None
                     return data
             except Exception as e:
-                self.last_error = f"HTTP-Fehler ({src}): {e}"
+                self.last_error = f"API/HTTP-Fehler ({src}): {e}"
                 return None
         else:
             if not os.path.exists(src):
@@ -812,6 +825,7 @@ class ADSBLogger:
 
         script_path = self.get_script_path()
         backup_path = self.get_backup_path()
+        tmp_path = script_path + ".tmp"
 
         # Backup erstellen
         if os.path.exists(script_path):
@@ -820,11 +834,16 @@ class ADSBLogger:
                     cur_code = cur_f.read()
                 with open(backup_path, "w", encoding="utf-8") as bak_f:
                     bak_f.write(cur_code)
+                    bak_f.flush()
+                    try:
+                        os.fsync(bak_f.fileno())
+                    except Exception:
+                        pass
             except Exception as e:
                 print(f"[UPDATE WARNUNG] Backup konnte nicht gespeichert werden: {e}")
 
-        # Neue Datei schreiben
-        with open(script_path, "w", encoding="utf-8") as f:
+        # Neue Datei zunächst sicher in temporäre Datei schreiben
+        with open(tmp_path, "w", encoding="utf-8") as f:
             f.write(new_code)
             f.flush()
             try:
@@ -833,9 +852,12 @@ class ADSBLogger:
                 pass
 
         try:
-            os.chmod(script_path, 0o755)
+            os.chmod(tmp_path, 0o755)
         except Exception:
             pass
+
+        # Atomarer Austausch der Datei (verhindert unvollständiges Schreiben/Sperren)
+        os.replace(tmp_path, script_path)
 
         remote_ver = "unknown"
         for line in new_code.splitlines()[:60]:
@@ -847,9 +869,11 @@ class ADSBLogger:
 
         if restart:
             def _restart_worker():
-                time.sleep(1.2)
+                time.sleep(1.0)
+                print("[UPDATE] Halte Dienst/Logger für sicheren Neustart an...")
+                self.running = False
                 try:
-                    res = os.system("systemctl restart adsb-logger 2>/dev/null")
+                    res = os.system("systemctl restart adsb-logger 2>/dev/null || (systemctl stop adsb-logger 2>/dev/null && sleep 1 && systemctl start adsb-logger 2>/dev/null)")
                     if res == 0:
                         return
                 except Exception:
@@ -864,7 +888,7 @@ class ADSBLogger:
 
         return {
             "success": True,
-            "message": f"Skript erfolgreich auf Version {remote_ver} aktualisiert! Dienst wird in 1-2 Sekunden neu gestartet.",
+            "message": f"Skript erfolgreich auf Version {remote_ver} aktualisiert! Dienst wird jetzt sauber neu gestartet.",
             "version": remote_ver,
             "script_path": script_path,
             "backup_path": backup_path,
@@ -874,6 +898,7 @@ class ADSBLogger:
     def rollback_backup(self, restart: bool = True) -> Dict[str, Any]:
         script_path = self.get_script_path()
         backup_path = self.get_backup_path()
+        tmp_path = script_path + ".tmp"
 
         if not os.path.exists(backup_path):
             raise FileNotFoundError("Keine Backup-Datei (.bak) vorhanden.")
@@ -883,14 +908,30 @@ class ADSBLogger:
 
         compile(bak_code, "adsb_logger_rollback.py", "exec")
 
-        with open(script_path, "w", encoding="utf-8") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             f.write(bak_code)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+
+        try:
+            os.chmod(tmp_path, 0o755)
+        except Exception:
+            pass
+
+        os.replace(tmp_path, script_path)
 
         if restart:
             def _restart_worker():
-                time.sleep(1.2)
+                time.sleep(1.0)
+                print("[ROLLBACK] Halte Dienst/Logger für Neustart an...")
+                self.running = False
                 try:
-                    os.system("systemctl restart adsb-logger 2>/dev/null")
+                    res = os.system("systemctl restart adsb-logger 2>/dev/null || (systemctl stop adsb-logger 2>/dev/null && sleep 1 && systemctl start adsb-logger 2>/dev/null)")
+                    if res == 0:
+                        return
                 except Exception:
                     pass
                 try:
@@ -903,7 +944,7 @@ class ADSBLogger:
 
         return {
             "success": True,
-            "message": "Backup (.bak) erfolgreich wiederhergestellt! Dienst startet neu."
+            "message": "Backup (.bak) erfolgreich wiederhergestellt! Dienst wird sauber neu gestartet."
         }
 
     def get_status_dict(self) -> Dict[str, Any]:
@@ -1085,9 +1126,11 @@ class ADSBLogger:
         <h2 style="font-size: 15px; margin-bottom: 12px; font-weight: 600;">⚙️ Einstellungen & Steuerung</h2>
         <form id="config-form" onsubmit="saveConfig(event)">
           <div class="form-group">
-            <label for="cfg-source">ADS-B Quelle (aircraft.json URL oder Pfad)</label>
-            <input type="text" id="cfg-source" name="source" placeholder="http://192.168.1.200/data/aircraft.json oder /run/readsb/aircraft.json">
+            <label for="cfg-source">ADS-B Quelle (REST API-URL oder aircraft.json Pfad)</label>
+            <input type="text" id="cfg-source" name="source" placeholder="https://opendata.adsb.fi/api/v3/lat/47.259665/lon/11.3431121/dist/25">
             <div style="display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap;">
+              <button type="button" class="btn btn-secondary" style="font-size: 11px; padding: 3px 8px; color: #38bdf8;" onclick="setSource('https://opendata.adsb.fi/api/v3/lat/47.259665/lon/11.3431121/dist/25')">📍 Innsbruck 25 NM (adsb.fi)</button>
+              <button type="button" class="btn btn-secondary" style="font-size: 11px; padding: 3px 8px;" onclick="setSource('https://opendata.adsb.fi/api/v3/lat/47.259665/lon/11.3431121/dist/50')">📍 Innsbruck 50 NM (adsb.fi)</button>
               <button type="button" class="btn btn-secondary" style="font-size: 11px; padding: 3px 8px;" onclick="setSource('/run/readsb/aircraft.json')">readsb (Lokal)</button>
               <button type="button" class="btn btn-secondary" style="font-size: 11px; padding: 3px 8px;" onclick="setSource('http://192.168.1.200/data/aircraft.json')">LAN-IP (.200)</button>
             </div>
@@ -1254,19 +1297,19 @@ class ADSBLogger:
         const data = await res.json();
         
         document.getElementById('stat-active').textContent = data.active_aircraft_total;
-        document.getElementById('stat-active-cs').textContent = 'Davon mit Flugnummer: ' + data.active_with_callsign;
+        document.getElementById('stat-active-cs').textContent = \`Davon mit Flugnummer: \${data.active_with_callsign}\`;
         document.getElementById('stat-logged').textContent = data.logged_flights_count;
-        document.getElementById('stat-csv-size').textContent = 'CSV-Größe: ' + Math.round(data.csv_size_bytes / 1024) + ' KB';
-        document.getElementById('stat-interval').textContent = data.interval + 's';
-        document.getElementById('stat-uptime').textContent = 'Uptime: ' + data.uptime_formatted;
+        document.getElementById('stat-csv-size').textContent = \`CSV-Größe: \${Math.round(data.csv_size_bytes / 1024)} KB\`;
+        document.getElementById('stat-interval').textContent = \`\${data.interval}s\`;
+        document.getElementById('stat-uptime').textContent = \`Uptime: \${data.uptime_formatted}\`;
         document.getElementById('stat-source').textContent = data.source;
-        document.getElementById('stat-cycle').textContent = 'Letzter Abruf: ' + (data.last_cycle_time || 'Noch keiner');
+        document.getElementById('stat-cycle').textContent = \`Letzter Abruf: \${data.last_cycle_time || 'Noch keiner'}\`;
         document.getElementById('info-csv-path').textContent = data.csv_path;
         if (data.script_path && document.getElementById('info-script-path')) {
           document.getElementById('info-script-path').textContent = data.script_path;
         }
         if (data.version && document.getElementById('badge-version')) {
-          document.getElementById('badge-version').textContent = 'v' + data.version;
+          document.getElementById('badge-version').textContent = \`v\${data.version}\`;
         }
         const rollbackBtn = document.getElementById('btn-rollback');
         if (rollbackBtn) {
@@ -1304,22 +1347,24 @@ class ADSBLogger:
       box.innerHTML = '<span style="color: #60a5fa;">Verbinde mit GitHub (' + repo + '@' + branch + ')...</span>';
 
       try {
-        const res = await fetch('/api/update_check?repo=' + encodeURIComponent(repo) + '&branch=' + encodeURIComponent(branch));
+        const res = await fetch(\`/api/update_check?repo=\${encodeURIComponent(repo)}&branch=\${encodeURIComponent(branch)}\`);
         const data = await res.json();
         
         if (data.success) {
           if (data.up_to_date) {
-            box.innerHTML = 
-              '<div style="color: #34d399; font-weight: 600; margin-bottom: 4px;">✅ Skript ist auf dem neuesten Stand!</div>' +
-              '<div style="color: #94a3b8;">Installiert: <code>v' + data.current_version + '</code> | GitHub: <code>v' + data.remote_version + '</code> (' + Math.round(data.remote_bytes / 1024) + ' KB)</div>';
+            box.innerHTML = \`
+              <div style="color: #34d399; font-weight: 600; margin-bottom: 4px;">✅ Skript ist auf dem neuesten Stand!</div>
+              <div style="color: #94a3b8;">Installiert: <code>v\${data.current_version}</code> | GitHub: <code>v\${data.remote_version}</code> (\${Math.round(data.remote_bytes / 1024)} KB)</div>
+            \`;
           } else {
-            box.innerHTML = 
-              '<div style="color: #fbbf24; font-weight: 600; margin-bottom: 4px;">🎉 Neues Update auf GitHub verfügbar!</div>' +
-              '<div style="color: #cbd5e1;">Installiert: <code>v' + data.current_version + '</code> ➔ GitHub: <strong style="color:#60a5fa;">v' + data.remote_version + '</strong> (' + Math.round(data.remote_bytes / 1024) + ' KB)</div>' +
-              '<div style="color: #94a3b8; margin-top: 4px; font-size: 11px;">Klicke auf "Jetzt aktualisieren", um die neue Version herunterzuladen.</div>';
+            box.innerHTML = \`
+              <div style="color: #fbbf24; font-weight: 600; margin-bottom: 4px;">🎉 Neues Update auf GitHub verfügbar!</div>
+              <div style="color: #cbd5e1;">Installiert: <code>v\${data.current_version}</code> ➔ GitHub: <strong style="color:#60a5fa;">v\${data.remote_version}</strong> (\${Math.round(data.remote_bytes / 1024)} KB)</div>
+              <div style="color: #94a3b8; margin-top: 4px; font-size: 11px;">Klicke auf "Jetzt aktualisieren", um die neue Version herunterzuladen.</div>
+            \`;
           }
         } else {
-          box.innerHTML = '<span style="color: #f87171;">⚠️ ' + (data.error || 'Fehler beim Prüfen auf GitHub') + '</span>';
+          box.innerHTML = \`<span style="color: #f87171;">⚠️ \${data.error || 'Fehler beim Prüfen auf GitHub'}</span>\`;
         }
       } catch (err) {
         box.innerHTML = '<span style="color: #f87171;">⚠️ Verbindungsfehler zu GitHub. Bitte Internetverbindung prüfen.</span>';
@@ -1333,7 +1378,7 @@ class ADSBLogger:
       const repo = document.getElementById('gh-repo').value.trim() || 'tirolerhut/adsb-flight-tracker';
       const branch = document.getElementById('gh-branch').value.trim() || 'main';
       
-      if (!confirm('Möchtest du das ADS-B Logger Skript jetzt direkt von GitHub (' + repo + '@' + branch + ') herunterladen und den Dienst neu starten?')) {
+      if (!confirm(\`Möchtest du das ADS-B Logger Skript jetzt direkt von GitHub (\${repo}@\${branch}) herunterladen und den Dienst neu starten?\`)) {
         return;
       }
 
@@ -1355,15 +1400,16 @@ class ADSBLogger:
         
         if (data.success) {
           showAlert(data.message, true);
-          box.innerHTML = 
-            '<div style="color: #34d399; font-weight: 600;">✅ ' + data.message + '</div>' +
-            '<div style="color: #94a3b8; margin-top: 4px;">Version: <strong>v' + data.version + '</strong> (' + data.bytes + ' Bytes). Die Seite lädt in 4 Sekunden automatisch neu...</div>';
+          box.innerHTML = \`
+            <div style="color: #34d399; font-weight: 600;">✅ \${data.message}</div>
+            <div style="color: #94a3b8; margin-top: 4px;">Version: <strong>v\${data.version}</strong> (\${data.bytes} Bytes). Die Seite lädt in 4 Sekunden automatisch neu...</div>
+          \`;
           setTimeout(() => {
             window.location.reload();
           }, 4000);
         } else {
           showAlert(data.error || 'Update fehlgeschlagen', false);
-          box.innerHTML = '<span style="color: #f87171;">⚠️ Fehler: ' + (data.error || 'Update fehlgeschlagen') + '</span>';
+          box.innerHTML = \`<span style="color: #f87171;">⚠️ Fehler: \${data.error || 'Update fehlgeschlagen'}</span>\`;
           btn.disabled = false;
           btn.textContent = '🚀 Jetzt aktualisieren';
         }
@@ -1410,21 +1456,21 @@ class ADSBLogger:
         tbody.innerHTML = '<tr><td colspan="11" style="text-align: center; color: var(--text-muted); padding: 20px;">Noch keine Flüge geloggt.</td></tr>';
         return;
       }
-      tbody.innerHTML = rows.map(r => 
-        '<tr>' +
-          '<td style="color: #94a3b8; font-family: monospace;">' + (r.first_seen_utc || '') + '</td>' +
-          '<td><strong style="color: #38bdf8;">' + (r.callsign || '<span style="color:#64748b">kein Callsign</span>') + '</strong></td>' +
-          '<td><code style="color: #fbbf24;">' + (r.icao_hex || '') + '</code></td>' +
-          '<td><span style="color: #34d399; font-weight: 600; background: rgba(52, 211, 153, 0.1); padding: 2px 6px; border-radius: 4px;">' + (r.origin || '-') + '</span></td>' +
-          '<td><span style="color: #f472b6; font-weight: 600; background: rgba(244, 114, 182, 0.1); padding: 2px 6px; border-radius: 4px;">' + (r.destination || '-') + '</span></td>' +
-          '<td style="color: #a7f3d0;">' + (r.route || r.airline || '-') + '</td>' +
-          '<td>' + (r.type_code || '') + (r.registration ? ' (' + r.registration + ')' : '') + '</td>' +
-          '<td>' + (r.altitude_min_ft || '-') + ' / ' + (r.altitude_max_ft || '-') + ' ft</td>' +
-          '<td>' + (r.speed_max_kts ? r.speed_max_kts + ' kts' : '-') + '</td>' +
-          '<td>' + (r.duration_seconds ? r.duration_seconds + 's' : '-') + '</td>' +
-          '<td style="color: #94a3b8;">' + (r.rssi_max ? r.rssi_max + ' dB' : '-') + '</td>' +
-        '</tr>'
-      ).join('');
+      tbody.innerHTML = rows.map(r => \`
+        <tr>
+          <td style="color: #94a3b8; font-family: monospace;">\${r.first_seen_utc || ''}</td>
+          <td><strong style="color: #38bdf8;">\${r.callsign || '<span style="color:#64748b">kein Callsign</span>'}</strong></td>
+          <td><code style="color: #fbbf24;">\${r.icao_hex || ''}</code></td>
+          <td><span style="color: #34d399; font-weight: 600; background: rgba(52, 211, 153, 0.1); padding: 2px 6px; border-radius: 4px;">\${r.origin || '-'}</span></td>
+          <td><span style="color: #f472b6; font-weight: 600; background: rgba(244, 114, 182, 0.1); padding: 2px 6px; border-radius: 4px;">\${r.destination || '-'}</span></td>
+          <td style="color: #a7f3d0;">\${r.route || r.airline || '-'}</td>
+          <td>\${r.type_code || ''} \${r.registration ? '(' + r.registration + ')' : ''}</td>
+          <td>\${r.altitude_min_ft || '-'} / \${r.altitude_max_ft || '-'} ft</td>
+          <td>\${r.speed_max_kts ? r.speed_max_kts + ' kts' : '-'}</td>
+          <td>\${r.duration_seconds ? r.duration_seconds + 's' : '-'}</td>
+          <td style="color: #94a3b8;">\${r.rssi_max ? r.rssi_max + ' dB' : '-'}</td>
+        </tr>
+      \`).join('');
     }
 
     function filterTable() {
@@ -1489,11 +1535,11 @@ class ADSBLogger:
       const csvUrl = getCsvUrl();
       const origin = window.location.origin;
       return {
-        pandas: '# 🐍 Python (Pandas) Datenanalyse über HTTP\\nimport pandas as pd\\n\\nurl = "' + csvUrl + '"\\ndf = pd.read_csv(url)\\n\\nprint(f"Geloggte Flüge: {len(df)}")\\nprint(df[[\'first_seen_utc\', \'callsign\', \'airline\', \'origin\', \'destination\', \'altitude_max_ft\', \'speed_max_kts\']].head(10))\\n\\n# Analyse: Top Airlines\\nprint("\\\\nTop Airlines:")\\nprint(df[\'airline\'].value_counts().head(5))',
-        duckdb: '-- 🦆 DuckDB / SQL - Direktabfrage über HTTP\\nSELECT \\n    callsign, \\n    airline, \\n    origin || \' ➔ \' || destination AS route, \\n    altitude_max_ft, \\n    speed_max_kts, \\n    first_seen_utc\\nFROM read_csv_auto(\'' + csvUrl + '\')\\nWHERE callsign IS NOT NULL\\nORDER BY first_seen_utc DESC\\nLIMIT 20;',
-        r: '# 📈 R Data Analysis über HTTP\\nurl <- "' + csvUrl + '"\\nflights <- read.csv(url, stringsAsFactors = FALSE, encoding = "UTF-8")\\n\\ncat("Flüge gesamt:", nrow(flights), "\\\\n")\\nhead(flights[, c("first_seen_utc", "callsign", "airline", "origin", "destination")])\\nsummary(flights$altitude_max_ft)',
-        excel: '# 📊 Excel & Google Sheets Live-Datenquelle\\n\\nMicrosoft Excel:\\n1. Menü: Daten ➔ Aus dem Web\\n2. URL eingeben: ' + csvUrl + '\\n3. \'Laden\' wählen (Aktualisiert auf Knopfdruck oder im Intervall)\\n\\nGoogle Sheets (Zelle A1):\\n=IMPORTDATA("' + csvUrl + '")',
-        curl: '# 💻 cURL & Cronjob Backup\\n# 1. Gesamte CSV herunterladen:\\ncurl -sSL "' + csvUrl + '" -o /tmp/flights.csv\\n\\n# 2. Nur die neuesten 100 Flüge abfragen:\\ncurl -sSL "' + origin + '/api/csv?limit=100" -o /tmp/recent_flights.csv\\n\\n# 3. 15-Minuten Cronjob zur Archivierung:\\n# */15 * * * * curl -sSL "' + csvUrl + '" -o ~/archive_$(date +\\\\%Y\\\\%m\\\\%d_\\\\%H\\\\%M).csv'
+        pandas: \`# 🐍 Python (Pandas) Datenanalyse über HTTP\\nimport pandas as pd\\n\\nurl = "\${csvUrl}"\\ndf = pd.read_csv(url)\\n\\nprint(f"Geloggte Flüge: {len(df)}")\\nprint(df[['first_seen_utc', 'callsign', 'airline', 'origin', 'destination', 'altitude_max_ft', 'speed_max_kts']].head(10))\\n\\n# Analyse: Top Airlines\\nprint("\\\\nTop Airlines:")\\nprint(df['airline'].value_counts().head(5))\`,
+        duckdb: \`-- 🦆 DuckDB / SQL - Direktabfrage über HTTP\\nSELECT \\n    callsign, \\n    airline, \\n    origin || ' ➔ ' || destination AS route, \\n    altitude_max_ft, \\n    speed_max_kts, \\n    first_seen_utc\\nFROM read_csv_auto('\${csvUrl}')\\nWHERE callsign IS NOT NULL\\nORDER BY first_seen_utc DESC\\nLIMIT 20;\`,
+        r: \`# 📈 R Data Analysis über HTTP\\nurl <- "\${csvUrl}"\\nflights <- read.csv(url, stringsAsFactors = FALSE, encoding = "UTF-8")\\n\\ncat("Flüge gesamt:", nrow(flights), "\\\\n")\\nhead(flights[, c("first_seen_utc", "callsign", "airline", "origin", "destination")])\\nsummary(flights$altitude_max_ft)\`,
+        excel: \`# 📊 Excel & Google Sheets Live-Datenquelle\\n\\nMicrosoft Excel:\\n1. Menü: Daten ➔ Aus dem Web\\n2. URL eingeben: \${csvUrl}\\n3. 'Laden' wählen (Aktualisiert auf Knopfdruck oder im Intervall)\\n\\nGoogle Sheets (Zelle A1):\\n=IMPORTDATA("\${csvUrl}")\`,
+        curl: \`# 💻 cURL & Cronjob Backup\\n# 1. Gesamte CSV herunterladen:\\ncurl -sSL "\${csvUrl}" -o /tmp/flights.csv\\n\\n# 2. Nur die neuesten 100 Flüge abfragen:\\ncurl -sSL "\${origin}/api/csv?limit=100" -o /tmp/recent_flights.csv\\n\\n# 3. 15-Minuten Cronjob zur Archivierung:\\n# */15 * * * * curl -sSL "\${csvUrl}" -o ~/archive_$(date +\\\\%Y\\\\%m\\\\%d_\\\\%H\\\\%M).csv\`
       };
     }
 
@@ -1604,17 +1650,92 @@ class ADSBLogger:
                         self.logged_uids.add(uid)
 
 
+def run_cli_update(repo: str = DEFAULT_GITHUB_REPO, branch: str = DEFAULT_GITHUB_BRANCH, service_name: str = "adsb-logger"):
+    print("=" * 60)
+    print("ADS-B Logger CLI Update & Dienst-Verwaltung")
+    print("=" * 60)
+    print(f"[1/4] Prüfe und stoppe laufenden Hintergrunddienst ({service_name}.service)...")
+    os.system(f"systemctl stop {service_name}.service 2>/dev/null || true")
+    os.system("pkill -f adsb_logger.py 2>/dev/null || true")
+    time.sleep(1)
+    
+    print(f"[2/4] Lade aktuelle adsb_logger.py von GitHub ({repo}@{branch})...")
+    url = f"https://raw.githubusercontent.com/{repo}/{branch}/adsb_logger.py"
+    req = urllib.request.Request(url, headers={"User-Agent": f"ADSB-Logger-CLI-Updater/{SCRIPT_VERSION}"})
+    try:
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            new_code = resp.read().decode("utf-8")
+        if "class ADSBLogger" not in new_code:
+            raise ValueError("Heruntergeladene Datei ist kein gültiges ADS-B Logger Skript.")
+        compile(new_code, "update_test.py", "exec")
+    except Exception as e:
+        print(f"[FEHLER] Herunterladen oder Syntax-Prüfung fehlgeschlagen: {e}")
+        print(f"Starte Dienst '{service_name}.service' wieder...")
+        os.system(f"systemctl start {service_name}.service 2>/dev/null || true")
+        return
+
+    script_path = os.path.abspath(__file__)
+    backup_path = script_path + ".bak"
+    tmp_path = script_path + ".tmp"
+
+    try:
+        if os.path.exists(script_path):
+            with open(script_path, "r", encoding="utf-8") as cur_f:
+                cur_code = cur_f.read()
+            with open(backup_path, "w", encoding="utf-8") as bak_f:
+                bak_f.write(cur_code)
+                bak_f.flush()
+                try:
+                    os.fsync(bak_f.fileno())
+                except Exception:
+                    pass
+
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(new_code)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+
+        os.chmod(tmp_path, 0o755)
+        os.replace(tmp_path, script_path)
+        print(f"[3/4] Neue Skriptdatei sicher und atomar installiert.")
+    except Exception as e:
+        print(f"[FEHLER] Fehler beim Schreiben der Datei: {e}")
+        os.system(f"systemctl start {service_name}.service 2>/dev/null || true")
+        return
+
+    print(f"[4/4] Starte Dienst '{service_name}.service' wieder...")
+    res = os.system(f"systemctl start {service_name}.service 2>/dev/null || true")
+    if res == 0:
+        print(f"[ERFOLG] Update auf Version {SCRIPT_VERSION} abgeschlossen und Dienst gestartet!")
+    else:
+        print(f"[HINWEIS] Skript aktualisiert. Falls nicht als Dienst betrieben, manuell starten.")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="ADS-B aircraft.json Logger & Web Dashboard")
-    parser.add_argument("--source", "-s", default="/run/readsb/aircraft.json", help="Pfad oder HTTP-URL zur aircraft.json")
-    parser.add_argument("--output", "-o", default="flights.csv", help="CSV-Ausgabedatei")
-    parser.add_argument("--interval", "-i", type=float, default=5.0, help="Polling-Intervall in Sek")
-    parser.add_argument("--timeout", "-t", type=float, default=300.0, help="Inaktivitäts-Timeout in Sek")
-    parser.add_argument("--dedup-mode", "-d", choices=["daily", "strict_forever", "hex_only"], default="daily")
-    parser.add_argument("--immediate", action="store_true", help="Sofort bei Erhalt der Flugnummer loggen")
-    parser.add_argument("--port", "-p", type=int, default=7001, help="Port für das integrierte Webinterface (Standard: 7001)")
-    parser.add_argument("--no-adsbdb", action="store_true", help="ADSBDB Online-Routenabfrage deaktivieren")
+    parser = argparse.ArgumentParser(
+        description=f"ADS-B Flight Logger & Web Control Dashboard v{SCRIPT_VERSION} (Flughafen Innsbruck LOWI 25 NM API via adsb.fi)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument("--source", default=DEFAULT_SOURCE, help="REST API-URL (z. B. Innsbruck 25 NM API via adsb.fi) oder lokaler Pfad zu aircraft.json")
+    parser.add_argument("--output", default="flights.csv", help="Pfad zur CSV-Ausgabedatei")
+    parser.add_argument("--interval", type=float, default=5.0, help="Abfrage-Intervall in Sekunden")
+    parser.add_argument("--timeout", type=float, default=300.0, help="Flug-Timeout in Sekunden")
+    parser.add_argument("--dedup-mode", choices=["daily", "strict_forever", "hex_only"], default="daily", help="Deduplizierungs-Modus")
+    parser.add_argument("--immediate", action="store_true", help="Sofort beim ersten Empfang loggen")
+    parser.add_argument("--no-adsbdb", action="store_true", help="ADSBDB-Routenabfrage deaktivieren")
+    parser.add_argument("--port", type=int, default=7001, help="Port für das Web-Dashboard")
+    parser.add_argument("--update", action="store_true", help="Stoppt den Dienst, lädt die neueste Skript-Version von GitHub herunter und startet den Dienst neu")
+    parser.add_argument("--github-repo", default=DEFAULT_GITHUB_REPO, help="GitHub Repository für Updates")
+    parser.add_argument("--github-branch", default=DEFAULT_GITHUB_BRANCH, help="GitHub Branch für Updates")
+    parser.add_argument("--service-name", default="adsb-logger", help="Name des systemd-Dienstes")
     args = parser.parse_args()
+
+    if args.update:
+        run_cli_update(repo=args.github_repo, branch=args.github_branch, service_name=args.service_name)
+        return
 
     logger = ADSBLogger(
         source=args.source,
@@ -1635,7 +1756,7 @@ if __name__ == "__main__":
 export function generateSystemdService(
   pythonScriptPath = '/opt/adsb-logger/adsb_logger.py',
   csvPath = '/home/pi/adsb-data/flights.csv',
-  source = '/run/readsb/aircraft.json',
+  source = 'https://opendata.adsb.fi/api/v3/lat/47.259665/lon/11.3431121/dist/25',
   runUser = 'pi',
   port = 7001
 ): string {
@@ -1676,7 +1797,7 @@ export function generateInstallerBashScript(options?: {
   const installDir = options?.installDir || '/opt/adsb-logger';
   const csvDir = options?.csvDir || '$TARGET_HOME/adsb-data';
   const serviceName = options?.serviceName || 'adsb-logger';
-  const defaultSource = options?.defaultSource || '/run/readsb/aircraft.json';
+  const defaultSource = options?.defaultSource || 'https://opendata.adsb.fi/api/v3/lat/47.259665/lon/11.3431121/dist/25';
   const defaultNetworkUrl = options?.defaultNetworkUrl || 'http://192.168.1.200/data/aircraft.json';
   const defaultInterval = options?.defaultInterval || 5;
   const webPort = options?.webPort || 7001;
@@ -1779,21 +1900,30 @@ WEB_PORT="${webPort}"
 echo -e "\${GREEN}[✓]\${NC} Ziel-Benutzer: \${YELLOW}$TARGET_USER\${NC} (Gruppe: \${YELLOW}$TARGET_GROUP\${NC}, Home: \${YELLOW}$TARGET_HOME\${NC})"
 echo ""
 
-# 3. Interaktive Abfrage: Installations-Variante (Lokal vs. Netzwerk)
-echo -e "\${CYAN}Bitte wähle die Installationsvariante:\${NC}"
-echo -e "  \${YELLOW}1)\${NC} Lokale ADS-B Quelle (readsb / dump1090-fa auf diesem Raspberry Pi)"
-echo -e "  \${YELLOW}2)\${NC} Netzwerk- / HTTP-Quelle (z. B. anderer Empfänger im LAN / IP-Adresse)"
-prompt_user "Auswahl [1 oder 2, Standard: 1]: " "1" VARIANT_CHOICE
+# 3. Interaktive Abfrage: Installations-Variante (Innsbruck API vs. Lokale Hardware vs. LAN IP)
+echo -e "\${CYAN}Bitte wähle die primäre ADS-B Datenquelle:\${NC}"
+echo -e "  \${YELLOW}1)\${NC} REST-API: Flughafen Innsbruck LOWI (25 NM Radius über adsb.fi) \${GREEN}[Empfohlen]\${NC}"
+echo -e "  \${YELLOW}2)\${NC} Lokaler ADS-B Empfänger (readsb / dump1090-fa auf diesem Raspberry Pi)"
+echo -e "  \${YELLOW}3)\${NC} Netzwerk- / HTTP-Quelle (z. B. anderer Tar1090/readsb Empfänger im LAN)"
+echo -e "  \${YELLOW}4)\${NC} Benutzerdefinierte URL oder Datei"
+prompt_user "Auswahl [1-4, Standard: 1]: " "1" VARIANT_CHOICE
 
 TARGET_SOURCE=""
-if [ "$VARIANT_CHOICE" = "2" ]; then
+if [ "$VARIANT_CHOICE" = "1" ]; then
+  TARGET_SOURCE="https://opendata.adsb.fi/api/v3/lat/47.259665/lon/11.3431121/dist/25"
+  echo -e "\${GREEN}[✓]\${NC} Verwende Innsbruck 25 NM API: \${YELLOW}$TARGET_SOURCE\${NC}"
+elif [ "$VARIANT_CHOICE" = "3" ]; then
   echo ""
-  echo -e "\${CYAN}[Variante 2: Netzwerk-Quelle]\${NC}"
+  echo -e "\${CYAN}[Variante 3: Netzwerk-Quelle]\${NC}"
   prompt_user "Netzwerkpfad / URL zu aircraft.json [Standard: ${defaultNetworkUrl}]: " "${defaultNetworkUrl}" TARGET_SOURCE
   echo -e "\${GREEN}[✓]\${NC} Verwende Netzwerk-Quelle: \${YELLOW}$TARGET_SOURCE\${NC}"
+elif [ "$VARIANT_CHOICE" = "4" ]; then
+  echo ""
+  prompt_user "Gib die vollständige URL oder den Dateipfad an: " "https://opendata.adsb.fi/api/v3/lat/47.259665/lon/11.3431121/dist/25" TARGET_SOURCE
+  echo -e "\${GREEN}[✓]\${NC} Verwende benutzerdefinierte Quelle: \${YELLOW}$TARGET_SOURCE\${NC}"
 else
   echo ""
-  echo -e "\${CYAN}[Variante 1: Lokale Erkennung]\${NC}"
+  echo -e "\${CYAN}[Variante 2: Lokale Hardware]\${NC}"
   echo -e "\${BLUE}[Suche]\${NC} Scanne nach aktiver lokaler aircraft.json (readsb / dump1090-fa)..."
   SOURCE_CANDIDATES=(
     "/run/readsb/aircraft.json"
@@ -1813,7 +1943,7 @@ else
   done
 
   if [ -z "$TARGET_SOURCE" ]; then
-    TARGET_SOURCE="${defaultSource}"
+    TARGET_SOURCE="/run/readsb/aircraft.json"
     echo -e "\${YELLOW}[!] Keine laufende aircraft.json im RAM gefunden.\${NC}"
     echo -e "    Verwende Standardpfad: \${YELLOW}$TARGET_SOURCE\${NC}"
   fi
@@ -1826,7 +1956,7 @@ echo -e "\${GREEN}[✓]\${NC} Abfrageintervall gesetzt auf: \${YELLOW}\${POLL_IN
 echo ""
 
 # 5. Systempakete & Python 3 Abhängigkeiten prüfen & installieren
-echo -e "\${BLUE}[1/4]\${NC} Prüfe erforderliche Systempakete & Abhängigkeiten..."
+echo -e "\${BLUE}[1/5]\${NC} Prüfe erforderliche Systempakete & Abhängigkeiten..."
 
 REQUIRED_PACKAGES=("python3" "curl" "gawk")
 MISSING_PACKAGES=()
@@ -1873,8 +2003,21 @@ else
   echo -e "\${RED}[WARNUNG] systemctl nicht gefunden. Hintergrunddienst kann evtl. nicht registriert werden.\${NC}"
 fi
 
-# 6. Installationsverzeichnisse & Skript anlegen
-echo -e "\${BLUE}[2/4]\${NC} Erstelle Verzeichnisse & installiere Python-Skript..."
+# 5. Vorhandenen Hintergrunddienst stoppen, falls er läuft (verhindert Dateisperren / unvollständiges Überschreiben)
+echo -e "\${BLUE}[2/5]\${NC} Prüfe auf laufenden Hintergrunddienst..."
+if systemctl is-active --quiet "${serviceName}.service" 2>/dev/null; then
+  echo -e "\${YELLOW}[!] Bestehender Dienst '${serviceName}.service' ist aktiv.\${NC}"
+  echo -e "\${BLUE}[Stop]\${NC} Halte Dienst an, damit adsb_logger.py sicher überschrieben und aktualisiert werden kann..."
+  systemctl stop "${serviceName}.service" 2>/dev/null || true
+  sleep 1
+  echo -e "\${GREEN}[✓]\${NC} Dienst '${serviceName}.service' erfolgreich angehalten."
+fi
+# Beende auch eventuelle lose laufende Python-Prozesse des Loggers
+pkill -f "$INSTALL_DIR/adsb_logger.py" 2>/dev/null || true
+pkill -f "adsb_logger.py" 2>/dev/null || true
+
+# 6. Installationsverzeichnisse & Skript sicher atomar anlegen
+echo -e "\${BLUE}[3/5]\${NC} Erstelle Verzeichnisse & installiere Python-Skript..."
 mkdir -p "$INSTALL_DIR"
 mkdir -p "$DATA_DIR"
 
@@ -1882,19 +2025,58 @@ if id "$TARGET_USER" &>/dev/null; then
   chown -R "$TARGET_USER:$TARGET_GROUP" "$DATA_DIR" 2>/dev/null || chown -R "$TARGET_USER" "$DATA_DIR" 2>/dev/null || true
 fi
 
-# Schreibe adsb_logger.py
-cat << 'EOF_PYTHON' > "$INSTALL_DIR/adsb_logger.py"
+# Schreibe adsb_logger.py zuerst in temporäre Datei
+cat << 'EOF_PYTHON' > "$INSTALL_DIR/adsb_logger.py.tmp"
 ${PYTHON_SCRIPT_CODE}
 EOF_PYTHON
+
+# Syntaxprüfung vor dem atomaren Austausch
+if python3 -m py_compile "$INSTALL_DIR/adsb_logger.py.tmp" &>/dev/null; then
+  mv -f "$INSTALL_DIR/adsb_logger.py.tmp" "$INSTALL_DIR/adsb_logger.py"
+else
+  echo -e "\${YELLOW}[!] Warnung bei Syntaxprüfung, übernehme Datei dennoch...\${NC}"
+  mv -f "$INSTALL_DIR/adsb_logger.py.tmp" "$INSTALL_DIR/adsb_logger.py"
+fi
 
 chmod +x "$INSTALL_DIR/adsb_logger.py"
 if id "$TARGET_USER" &>/dev/null; then
   chown -R "$TARGET_USER:$TARGET_GROUP" "$INSTALL_DIR" 2>/dev/null || chown -R "$TARGET_USER" "$INSTALL_DIR" 2>/dev/null || true
 fi
-echo -e "\${GREEN}[✓]\${NC} Skript installiert in: \${YELLOW}$INSTALL_DIR/adsb_logger.py\${NC}"
+echo -e "\${GREEN}[✓]\${NC} Skript sicher installiert in: \${YELLOW}$INSTALL_DIR/adsb_logger.py\${NC}"
+
+# Automatischen Update-Befehl auf dem System bereitstellen
+cat << 'EOF_UPDATE' > "$INSTALL_DIR/update.sh"
+#!/bin/bash
+set -e
+echo -e "\\033[0;34m====================================================\\033[0m"
+echo -e "\\033[0;34m        ADS-B Logger - Automatisches Update         \\033[0m"
+echo -e "\\033[0;34m====================================================\\033[0m"
+echo -e "[1/4] Halte Dienst ${serviceName}.service an..."
+systemctl stop ${serviceName}.service 2>/dev/null || true
+pkill -f adsb_logger.py 2>/dev/null || true
+sleep 1
+echo -e "[2/4] Lade neueste Version von GitHub (${githubRepo}@${githubBranch})..."
+curl -sSL "https://raw.githubusercontent.com/${githubRepo}/${githubBranch}/adsb_logger.py" -o "${installDir}/adsb_logger.py.tmp"
+if [ -s "${installDir}/adsb_logger.py.tmp" ] && python3 -m py_compile "${installDir}/adsb_logger.py.tmp" 2>/dev/null; then
+  mv -f "${installDir}/adsb_logger.py.tmp" "${installDir}/adsb_logger.py"
+  chmod +x "${installDir}/adsb_logger.py"
+  echo -e "\\033[0;32m[✓] Skript erfolgreich aktualisiert.\\033[0m"
+else
+  echo -e "\\033[0;31m[FEHLER] Herunterladen oder Syntaxprüfung fehlgeschlagen.\\033[0m"
+  rm -f "${installDir}/adsb_logger.py.tmp"
+fi
+echo -e "[3/4] Starte Dienst ${serviceName}.service neu..."
+systemctl start ${serviceName}.service
+sleep 1
+echo -e "[4/4] Dienst-Status:"
+systemctl status ${serviceName}.service --no-pager || true
+EOF_UPDATE
+
+chmod +x "$INSTALL_DIR/update.sh"
+ln -sf "$INSTALL_DIR/update.sh" /usr/local/bin/update-adsb-logger 2>/dev/null || true
 
 # 7. Systemd Hintergrunddienst einrichten
-echo -e "\${BLUE}[3/4]\${NC} Richte systemd Service ein..."
+echo -e "\${BLUE}[4/5]\${NC} Richte systemd Service ein..."
 
 cat << EOF_SERVICE > "$SERVICE_FILE"
 [Unit]
@@ -1922,7 +2104,7 @@ chmod 644 "$SERVICE_FILE"
 echo -e "\${GREEN}[✓]\${NC} Service-Datei erstellt: \${YELLOW}$SERVICE_FILE\${NC}"
 
 # 8. Daemon neu laden und Dienst starten
-echo -e "\${BLUE}[4/4]\${NC} Aktiviere und starte Hintergrunddienst..."
+echo -e "\${BLUE}[5/5]\${NC} Aktiviere und starte Hintergrunddienst..."
 systemctl daemon-reload
 systemctl enable "${serviceName}.service"
 systemctl restart "${serviceName}.service"
@@ -1951,14 +2133,16 @@ if systemctl is-active --quiet "${serviceName}.service"; then
   echo -e "  • Quelle & Intervall direkt im Browser ändern"
   echo -e "  • Logger per Knopfdruck neu starten"
   echo -e "  • CSV-Inhalt im Live-Statusfenster durchsuchen"
-  echo -e "  • CSV-Download mit einem Klick"
+  echo -e "  • CSV-Download & HTTP-Stream (GET /flights.csv)"
+  echo -e "  • 1-Klick Online-Update von GitHub"
   echo -e ""
   echo -e "Quelle:             \${YELLOW}$TARGET_SOURCE\${NC}"
   echo -e "Intervall:          \${YELLOW}\${POLL_INTERVAL} Sekunden\${NC}"
   echo -e "CSV-Ausgabedatei:   \${YELLOW}$DATA_DIR/flights.csv\${NC}"
   echo -e "Web-Port:           \${YELLOW}$WEB_PORT\${NC}"
-  echo -e ""
-  echo -e "Service-Befehle:"
+  echo ""
+  echo -e "Service- & Update-Befehle:"
+  echo -e "  Schnell-Update:     \${YELLOW}sudo update-adsb-logger\${NC}  oder  \${YELLOW}sudo python3 $INSTALL_DIR/adsb_logger.py --update\${NC}"
   echo -e "  Status überprüfen:  \${YELLOW}sudo systemctl status ${serviceName}.service\${NC}"
   echo -e "  Live-Logs ansehen:  \${YELLOW}sudo journalctl -u ${serviceName}.service -f\${NC}"
   echo -e "  Service stoppen:    \${YELLOW}sudo systemctl stop ${serviceName}.service\${NC}"
