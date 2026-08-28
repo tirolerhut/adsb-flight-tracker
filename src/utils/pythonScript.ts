@@ -436,9 +436,9 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
                     with open(logger.csv_path, "rb") as f:
                         content_bytes = f.read()
                 except Exception:
-                    content_bytes = (",".join(CSV_FIELDNAMES) + "\n").encode("utf-8")
+                    content_bytes = (",".join(CSV_FIELDNAMES) + "\\n").encode("utf-8")
             else:
-                content_bytes = (",".join(CSV_FIELDNAMES) + "\n").encode("utf-8")
+                content_bytes = (",".join(CSV_FIELDNAMES) + "\\n").encode("utf-8")
 
         self.send_response(200)
         self.send_header("Content-Type", "text/csv; charset=utf-8")
@@ -1535,11 +1535,11 @@ class ADSBLogger:
       const csvUrl = getCsvUrl();
       const origin = window.location.origin;
       return {
-        pandas: \`# 🐍 Python (Pandas) Datenanalyse über HTTP\\nimport pandas as pd\\n\\nurl = "\${csvUrl}"\\ndf = pd.read_csv(url)\\n\\nprint(f"Geloggte Flüge: {len(df)}")\\nprint(df[['first_seen_utc', 'callsign', 'airline', 'origin', 'destination', 'altitude_max_ft', 'speed_max_kts']].head(10))\\n\\n# Analyse: Top Airlines\\nprint("\\\\nTop Airlines:")\\nprint(df['airline'].value_counts().head(5))\`,
-        duckdb: \`-- 🦆 DuckDB / SQL - Direktabfrage über HTTP\\nSELECT \\n    callsign, \\n    airline, \\n    origin || ' ➔ ' || destination AS route, \\n    altitude_max_ft, \\n    speed_max_kts, \\n    first_seen_utc\\nFROM read_csv_auto('\${csvUrl}')\\nWHERE callsign IS NOT NULL\\nORDER BY first_seen_utc DESC\\nLIMIT 20;\`,
-        r: \`# 📈 R Data Analysis über HTTP\\nurl <- "\${csvUrl}"\\nflights <- read.csv(url, stringsAsFactors = FALSE, encoding = "UTF-8")\\n\\ncat("Flüge gesamt:", nrow(flights), "\\\\n")\\nhead(flights[, c("first_seen_utc", "callsign", "airline", "origin", "destination")])\\nsummary(flights$altitude_max_ft)\`,
-        excel: \`# 📊 Excel & Google Sheets Live-Datenquelle\\n\\nMicrosoft Excel:\\n1. Menü: Daten ➔ Aus dem Web\\n2. URL eingeben: \${csvUrl}\\n3. 'Laden' wählen (Aktualisiert auf Knopfdruck oder im Intervall)\\n\\nGoogle Sheets (Zelle A1):\\n=IMPORTDATA("\${csvUrl}")\`,
-        curl: \`# 💻 cURL & Cronjob Backup\\n# 1. Gesamte CSV herunterladen:\\ncurl -sSL "\${csvUrl}" -o /tmp/flights.csv\\n\\n# 2. Nur die neuesten 100 Flüge abfragen:\\ncurl -sSL "\${origin}/api/csv?limit=100" -o /tmp/recent_flights.csv\\n\\n# 3. 15-Minuten Cronjob zur Archivierung:\\n# */15 * * * * curl -sSL "\${csvUrl}" -o ~/archive_$(date +\\\\%Y\\\\%m\\\\%d_\\\\%H\\\\%M).csv\`
+        pandas: \`# 🐍 Python (Pandas) Datenanalyse über HTTP\\\\nimport pandas as pd\\\\n\\\\nurl = "\${csvUrl}"\\\\ndf = pd.read_csv(url)\\\\n\\\\nprint(f"Geloggte Flüge: {len(df)}")\\\\nprint(df[['first_seen_utc', 'callsign', 'airline', 'origin', 'destination', 'altitude_max_ft', 'speed_max_kts']].head(10))\\\\n\\\\n# Analyse: Top Airlines\\\\nprint("\\\\nTop Airlines:")\\\\nprint(df['airline'].value_counts().head(5))\`,
+        duckdb: \`-- 🦆 DuckDB / SQL - Direktabfrage über HTTP\\\\nSELECT \\\\n    callsign, \\\\n    airline, \\\\n    origin || ' ➔ ' || destination AS route, \\\\n    altitude_max_ft, \\\\n    speed_max_kts, \\\\n    first_seen_utc\\\\nFROM read_csv_auto('\${csvUrl}')\\\\nWHERE callsign IS NOT NULL\\\\nORDER BY first_seen_utc DESC\\\\nLIMIT 20;\`,
+        r: \`# 📈 R Data Analysis über HTTP\\\\nurl <- "\${csvUrl}"\\\\nflights <- read.csv(url, stringsAsFactors = FALSE, encoding = "UTF-8")\\\\n\\\\ncat("Flüge gesamt:", nrow(flights), "\\\\n")\\\\nhead(flights[, c("first_seen_utc", "callsign", "airline", "origin", "destination")])\\\\nsummary(flights$altitude_max_ft)\`,
+        excel: \`# 📊 Excel & Google Sheets Live-Datenquelle\\\\n\\\\nMicrosoft Excel:\\\\n1. Menü: Daten ➔ Aus dem Web\\\\n2. URL eingeben: \${csvUrl}\\\\n3. 'Laden' wählen (Aktualisiert auf Knopfdruck oder im Intervall)\\\\n\\\\nGoogle Sheets (Zelle A1):\\\\n=IMPORTDATA("\${csvUrl}")\`,
+        curl: \`# 💻 cURL & Cronjob Backup\\\\n# 1. Gesamte CSV herunterladen:\\\\ncurl -sSL "\${csvUrl}" -o /tmp/flights.csv\\\\n\\\\n# 2. Nur die neuesten 100 Flüge abfragen:\\\\ncurl -sSL "\${origin}/api/csv?limit=100" -o /tmp/recent_flights.csv\\\\n\\\\n# 3. 15-Minuten Cronjob zur Archivierung:\\\\n# */15 * * * * curl -sSL "\${csvUrl}" -o ~/archive_$(date +\\\\%Y\\\\%m\\\\%d_\\\\%H\\\\%M).csv\`
       };
     }
 
@@ -1672,61 +1672,51 @@ def run_cli_update(repo: str = DEFAULT_GITHUB_REPO, branch: str = DEFAULT_GITHUB
         print(f"[FEHLER] Herunterladen oder Syntax-Prüfung fehlgeschlagen: {e}")
         print(f"Starte Dienst '{service_name}.service' wieder...")
         os.system(f"systemctl start {service_name}.service 2>/dev/null || true")
-        return
+        sys.exit(1)
 
     script_path = os.path.abspath(__file__)
-    backup_path = script_path + ".bak"
     tmp_path = script_path + ".tmp"
+    bak_path = script_path + ".bak"
 
-    try:
-        if os.path.exists(script_path):
-            with open(script_path, "r", encoding="utf-8") as cur_f:
-                cur_code = cur_f.read()
-            with open(backup_path, "w", encoding="utf-8") as bak_f:
-                bak_f.write(cur_code)
-                bak_f.flush()
-                try:
-                    os.fsync(bak_f.fileno())
-                except Exception:
-                    pass
+    # Backup anlegen
+    if os.path.exists(script_path):
+        try:
+            with open(script_path, "r", encoding="utf-8") as f_cur:
+                cur_code = f_cur.read()
+            with open(bak_path, "w", encoding="utf-8") as f_bak:
+                f_bak.write(cur_code)
+        except Exception:
+            pass
 
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(new_code)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except Exception:
-                pass
+    # Atomar schreiben
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(new_code)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+    os.chmod(tmp_path, 0o755)
+    os.replace(tmp_path, script_path)
+    print(f"[3/4] Skript sicher und atomar aktualisiert ({len(new_code)} Bytes)")
 
-        os.chmod(tmp_path, 0o755)
-        os.replace(tmp_path, script_path)
-        print(f"[3/4] Neue Skriptdatei sicher und atomar installiert.")
-    except Exception as e:
-        print(f"[FEHLER] Fehler beim Schreiben der Datei: {e}")
-        os.system(f"systemctl start {service_name}.service 2>/dev/null || true")
-        return
-
-    print(f"[4/4] Starte Dienst '{service_name}.service' wieder...")
-    res = os.system(f"systemctl start {service_name}.service 2>/dev/null || true")
-    if res == 0:
-        print(f"[ERFOLG] Update auf Version {SCRIPT_VERSION} abgeschlossen und Dienst gestartet!")
-    else:
-        print(f"[HINWEIS] Skript aktualisiert. Falls nicht als Dienst betrieben, manuell starten.")
+    print(f"[4/4] Starte Hintergrunddienst ({service_name}.service) neu...")
+    os.system(f"systemctl start {service_name}.service 2>/dev/null || true")
+    time.sleep(1)
+    os.system(f"systemctl is-active --quiet {service_name}.service && echo '[✓] Dienst ist aktiv und läuft!' || echo '[!] Bitte Status mit sudo systemctl status {service_name}.service prüfen.'")
+    print("=" * 60)
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description=f"ADS-B Flight Logger & Web Control Dashboard v{SCRIPT_VERSION} (Flughafen Innsbruck LOWI 25 NM API via adsb.fi)",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    parser.add_argument("--source", default=DEFAULT_SOURCE, help="REST API-URL (z. B. Innsbruck 25 NM API via adsb.fi) oder lokaler Pfad zu aircraft.json")
-    parser.add_argument("--output", default="flights.csv", help="Pfad zur CSV-Ausgabedatei")
-    parser.add_argument("--interval", type=float, default=5.0, help="Abfrage-Intervall in Sekunden")
-    parser.add_argument("--timeout", type=float, default=300.0, help="Flug-Timeout in Sekunden")
-    parser.add_argument("--dedup-mode", choices=["daily", "strict_forever", "hex_only"], default="daily", help="Deduplizierungs-Modus")
-    parser.add_argument("--immediate", action="store_true", help="Sofort beim ersten Empfang loggen")
-    parser.add_argument("--no-adsbdb", action="store_true", help="ADSBDB-Routenabfrage deaktivieren")
-    parser.add_argument("--port", type=int, default=7001, help="Port für das Web-Dashboard")
+    parser = argparse.ArgumentParser(description="ADS-B Flugzeug-Logger (Airport Innsbruck 25 NM API via adsb.fi) & Web Dashboard")
+    parser.add_argument("--source", "-s", default=DEFAULT_SOURCE, help=f"API-URL (z. B. opendata.adsb.fi API) oder Dateipfad zur aircraft.json (Standard: {DEFAULT_SOURCE})")
+    parser.add_argument("--output", "-o", default="flights.csv", help="CSV-Ausgabedatei")
+    parser.add_argument("--interval", "-i", type=float, default=5.0, help="Polling-Intervall in Sek")
+    parser.add_argument("--timeout", "-t", type=float, default=300.0, help="Inaktivitäts-Timeout in Sek")
+    parser.add_argument("--dedup-mode", "-d", choices=["daily", "strict_forever", "hex_only"], default="daily")
+    parser.add_argument("--immediate", action="store_true", help="Sofort bei Erhalt der Flugnummer loggen")
+    parser.add_argument("--port", "-p", type=int, default=7001, help="Port für das integrierte Webinterface (Standard: 7001)")
+    parser.add_argument("--no-adsbdb", action="store_true", help="ADSBDB Online-Routenabfrage deaktivieren")
     parser.add_argument("--update", action="store_true", help="Stoppt den Dienst, lädt die neueste Skript-Version von GitHub herunter und startet den Dienst neu")
     parser.add_argument("--github-repo", default=DEFAULT_GITHUB_REPO, help="GitHub Repository für Updates")
     parser.add_argument("--github-branch", default=DEFAULT_GITHUB_BRANCH, help="GitHub Branch für Updates")
