@@ -29,6 +29,7 @@ Hauptfunktionen:
 =============================================================================
 """
 
+import gzip
 import os
 import sys
 import time
@@ -47,7 +48,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from typing import Dict, Any, Optional, Set, List
 
-SCRIPT_VERSION = "2.6.0"
+SCRIPT_VERSION = "2.7.0"
 DEFAULT_GITHUB_REPO = "tirolerhut/adsb-flight-tracker"
 DEFAULT_GITHUB_BRANCH = "main"
 
@@ -56,6 +57,11 @@ DEFAULT_SOURCE = "https://opendata.adsb.fi/api/v3/lat/47.259665/lon/11.3431121/d
 INNSBRUCK_LAT = 47.259665
 INNSBRUCK_LON = 11.3431121
 INNSBRUCK_RADIUS_NM = 25.0
+
+# Cache für ADSBDB-Abfragen um API-Limits und Latenz zu minimieren
+_ADSBDB_ROUTE_CACHE: Dict[str, Dict[str, str]] = {}
+_ADSBDB_AC_CACHE: Dict[str, Dict[str, str]] = {}
+_CACHE_LOCK = threading.Lock()
 
 # Standard CSV-Spalten
 CSV_FIELDNAMES = [
@@ -197,14 +203,35 @@ class ActiveFlight:
         if rssi is not None and (self.rssi_max is None or rssi > self.rssi_max):
             self.rssi_max = rssi
 
-    def query_adsbdb(self, sync: bool = False, timeout: float = 2.5):
+    def to_dict(self) -> Dict[str, Any]:
+        dt_first = datetime.datetime.fromtimestamp(self.first_seen_ts, tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        dt_last = datetime.datetime.fromtimestamp(self.last_seen_ts, tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        return {
+            "hex": self.hex.upper(),
+            "callsign": self.callsign or "-",
+            "registration": self.registration or "-",
+            "type_code": self.type_code or "-",
+            "aircraft_desc": self.aircraft_desc or "-",
+            "route": self.route or "-",
+            "airline": self.airline or "-",
+            "origin": self.origin or "-",
+            "destination": self.destination or "-",
+            "altitude_ft": int(self.alt_last) if self.alt_last is not None else "-",
+            "speed_kts": round(self.speed_last, 1) if self.speed_last is not None else "-",
+            "track_deg": round(self.track_last, 1) if self.track_last is not None else "-",
+            "lat": round(self.lat_last, 5) if self.lat_last is not None else "-",
+            "lon": round(self.lon_last, 5) if self.lon_last is not None else "-",
+            "dst_nm": round(self.min_receiver_dst, 1) if self.min_receiver_dst is not None else "-",
+            "squawk": self.squawk or "-",
+            "first_seen_utc": dt_first,
+            "last_seen_utc": dt_last,
+            "duration_s": max(0, int(self.last_seen_ts - self.first_seen_ts)),
+        }
+
+    def query_adsbdb(self, timeout: float = 2.0):
         """
         Ermittelt Flugdaten (Start, Ziel, Route, Fluggesellschaft, Flugzeugtyp)
-        mittels der ADSBDB API:
-        1. Primär für Start & Ziel über das ermittelte Rufzeichen:
-           https://api.adsbdb.com/v0/callsign/{CALLSIGN_ICAO}
-        2. Ergänzend für Flugzeugdaten über Mode-S Hex / Registrierung:
-           https://api.adsbdb.com/v0/aircraft/{MODE_S || REGISTRATION}
+        asynchron und nicht-blockierend über die ADSBDB API mit Caching.
         """
         if self.adsbdb_queried:
             return
@@ -221,11 +248,30 @@ class ActiveFlight:
 
         self.adsbdb_queried = True
 
-        def _do_fetch():
-            headers = {"User-Agent": "ADSB-Logger/1.0 (Raspberry Pi Tracker)"}
+        # Schneller Cache-Lookup (kein Netzwerk nötig)
+        with _CACHE_LOCK:
+            if has_cs and cs_clean in _ADSBDB_ROUTE_CACHE:
+                cached = _ADSBDB_ROUTE_CACHE[cs_clean]
+                if cached.get("origin"): self.origin = cached["origin"]
+                if cached.get("destination"): self.destination = cached["destination"]
+                if cached.get("airline"): self.airline = cached["airline"]
+                if cached.get("route"): self.route = cached["route"]
+            if ident and ident in _ADSBDB_AC_CACHE:
+                ac_c = _ADSBDB_AC_CACHE[ident]
+                if ac_c.get("registration") and not self.registration: self.registration = ac_c["registration"]
+                if ac_c.get("type_code") and not self.type_code: self.type_code = ac_c["type_code"]
+                if ac_c.get("aircraft_desc") and not self.aircraft_desc: self.aircraft_desc = ac_c["aircraft_desc"]
+                if ac_c.get("airline") and not self.airline: self.airline = ac_c["airline"]
+
+        # Falls alles bereits aus Cache gefüllt ist: kein API-Call nötig
+        if self.route and (self.registration or not ident):
+            return
+
+        def _do_fetch_async():
+            headers = {"User-Agent": "ADSB-Logger/2.7 (Raspberry Pi Tracker; +https://github.com/tirolerhut/adsb-flight-tracker)"}
             
             # 1. Ermittlung von Start & Ziel mit der Callsign-API: /v0/callsign/{CALLSIGN_ICAO}
-            if has_cs:
+            if has_cs and not self.route:
                 try:
                     cs_url = f"https://api.adsbdb.com/v0/callsign/{urllib.parse.quote(cs_clean)}"
                     cs_req = urllib.request.Request(cs_url, headers=headers)
@@ -244,11 +290,17 @@ class ActiveFlight:
                                 if al_name: self.route += f" ({al_name})"
                             elif al_name and not self.route:
                                 self.route = al_name
+                            
+                            with _CACHE_LOCK:
+                                _ADSBDB_ROUTE_CACHE[cs_clean] = {
+                                    "origin": self.origin, "destination": self.destination,
+                                    "airline": self.airline, "route": self.route
+                                }
                 except Exception:
                     pass
 
             # 2. Flugzeug-Stammdaten & Fallback-Route über Mode-S Hex / Registrierung
-            if ident:
+            if ident and (not self.registration or not self.type_code or not self.route):
                 try:
                     url = f"https://api.adsbdb.com/v0/aircraft/{urllib.parse.quote(ident)}"
                     if has_cs and (not self.origin or not self.destination):
@@ -270,6 +322,12 @@ class ActiveFlight:
                             if not self.airline and ac_info.get("registered_owner"):
                                 self.airline = ac_info.get("registered_owner")
 
+                            with _CACHE_LOCK:
+                                _ADSBDB_AC_CACHE[ident] = {
+                                    "registration": self.registration, "type_code": self.type_code,
+                                    "aircraft_desc": self.aircraft_desc, "airline": self.airline
+                                }
+
                         # Falls Start/Ziel noch nicht ermittelt wurden: Fallback aus aircraft response
                         if not self.origin or not self.destination:
                             fr = resp_obj.get("flightroute", {})
@@ -288,11 +346,8 @@ class ActiveFlight:
                 except Exception:
                     pass
 
-        if sync:
-            _do_fetch()
-        else:
-            t = threading.Thread(target=_do_fetch, daemon=True)
-            t.start()
+        # Immer in separatem Daemon-Thread ausführen (niemals den Logger-Loop blockieren!)
+        threading.Thread(target=_do_fetch_async, daemon=True).start()
 
     def get_flight_uid(self, mode: str = "daily") -> str:
         cs = self.callsign.strip().upper() if self.has_valid_callsign() else "NOCALL"
@@ -488,6 +543,17 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
                 self.send_json(logger.get_status_dict())
             return
 
+        elif path in ("/api/active", "/api/live", "/api/aircraft"):
+            active_list = logger.get_active_flights_list()
+            if is_head:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_cors_headers()
+                self.end_headers()
+            else:
+                self.send_json({"aircraft": active_list, "count": len(active_list), "timestamp": time.time()})
+            return
+
         elif path in ("/api/csv", "/flights.csv", "/data/flights.csv", "/csv", "/download", "/api/flights.csv"):
             query = urllib.parse.parse_qs(parsed.query)
             force_dl = (path == "/download")
@@ -671,12 +737,20 @@ class ADSBLogger:
         src = self.source
         if src.startswith("http://") or src.startswith("https://"):
             req = urllib.request.Request(src, headers={
-                "User-Agent": f"ADSB-Innsbruck-Logger/{SCRIPT_VERSION} (LOWI 25NM Point Tracker; +https://opendata.adsb.fi)",
-                "Accept": "application/json"
+                "User-Agent": f"Mozilla/5.0 (compatible; ADSB-Innsbruck-Logger/{SCRIPT_VERSION}; +https://opendata.adsb.fi)",
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip, deflate"
             })
             try:
-                with urllib.request.urlopen(req, timeout=6.0) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
+                with urllib.request.urlopen(req, timeout=7.0) as resp:
+                    headers = dict(resp.headers)
+                    raw = resp.read()
+                    if headers.get("content-encoding") == "gzip" or (len(raw) >= 2 and raw[:2] == b"\x1f\x8b"):
+                        try:
+                            raw = gzip.decompress(raw)
+                        except Exception:
+                            pass
+                    data = json.loads(raw.decode("utf-8", errors="replace"))
                     self.last_error = None
                     return data
             except Exception as e:
@@ -687,7 +761,7 @@ class ADSBLogger:
                 self.last_error = f"Lokale Datei nicht gefunden: {src}"
                 return None
             try:
-                with open(src, "r", encoding="utf-8") as f:
+                with open(src, "r", encoding="utf-8", errors="replace") as f:
                     data = json.load(f)
                     self.last_error = None
                     return data
@@ -701,7 +775,8 @@ class ADSBLogger:
         self.total_cycles += 1
         
         with self.lock:
-            for ac in (data.get("aircraft") or data.get("ac") or []):
+            ac_list = data.get("aircraft") or data.get("ac") or []
+            for ac in ac_list:
                 hex_id = (ac.get("hex") or "").strip().lower()
                 if not hex_id:
                     continue
@@ -713,16 +788,16 @@ class ADSBLogger:
                     flight = ActiveFlight(hex_id, now, ac)
                     self.active_flights[hex_id] = flight
                 
-                # Wenn Rufzeichen vorhanden ist: ADSBDB abfragen & sofort in CSV loggen
+                # Wenn Rufzeichen vorhanden ist: asynchron ADSBDB abfragen & sofort in CSV loggen
                 if flight.has_valid_callsign():
                     uid = flight.get_flight_uid(self.dedup_mode)
                     if uid not in self.logged_uids:
                         if not flight.adsbdb_queried and self.enable_adsbdb:
-                            flight.query_adsbdb(sync=True, timeout=2.0)
+                            flight.query_adsbdb(timeout=2.0)
                         self._write(flight, uid)
                         self.logged_uids.add(uid)
                     elif not flight.adsbdb_queried and self.enable_adsbdb:
-                        flight.query_adsbdb(sync=False)
+                        flight.query_adsbdb(timeout=2.0)
 
             # Abgelaufene Flüge (Timeout nach Verlassen des Empfangsbereichs)
             expired = [h for h, f in self.active_flights.items() if now - f.last_seen_ts > self.timeout_gap]
@@ -732,9 +807,15 @@ class ADSBLogger:
                 uid = flight.get_flight_uid(self.dedup_mode)
                 if uid not in self.logged_uids and flight.hex:
                     if not flight.adsbdb_queried and self.enable_adsbdb:
-                        flight.query_adsbdb(sync=True, timeout=2.0)
+                        flight.query_adsbdb(timeout=2.0)
                     self._write(flight, uid)
                     self.logged_uids.add(uid)
+
+    def get_active_flights_list(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            # Sortieren nach Entfernung oder letztem Empfang
+            flights = list(self.active_flights.values())
+            return [f.to_dict() for f in sorted(flights, key=lambda x: x.last_seen_ts, reverse=True)]
 
     def _write(self, flight: ActiveFlight, uid: str):
         try:
@@ -1238,12 +1319,47 @@ class ADSBLogger:
       </div>
     </div>
 
+    <!-- Live im Luftraum (Aktive Flugzeuge) -->
+    <div class="card" style="border-color: #38bdf8; background: linear-gradient(180deg, #0f172a 0%, #0b1329 100%);">
+      <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 12px;">
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <h2 style="font-size: 15px; font-weight: 700; color: #38bdf8;">📡 Aktuell im Luftraum (Live-Erfassung Innsbruck 25 NM)</h2>
+          <span id="badge-live-count" class="badge" style="background: rgba(56, 189, 248, 0.2); color: #38bdf8; border-color: rgba(56, 189, 248, 0.4);">0 Flugzeuge</span>
+        </div>
+        <div style="display: flex; gap: 8px;">
+          <button class="btn btn-secondary" onclick="loadLiveAircraft()" style="font-size: 12px; padding: 4px 10px;">🔄 Live neu laden</button>
+        </div>
+      </div>
+
+      <div class="table-container">
+        <table id="live-table">
+          <thead>
+            <tr>
+              <th>Rufzeichen</th>
+              <th>Hex</th>
+              <th>Fluggesellschaft / Route</th>
+              <th>Typ / Reg</th>
+              <th>Flughöhe</th>
+              <th>Speed</th>
+              <th>Kurs</th>
+              <th>Distanz LOWI</th>
+              <th>Squawk</th>
+              <th>Signal</th>
+            </tr>
+          </thead>
+          <tbody id="live-tbody">
+            <tr><td colspan="10" style="text-align: center; color: var(--text-muted); padding: 18px;">Empfange Live-Daten aus Innsbrucker Luftraum...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
     <!-- CSV Live Statusfenster -->
     <div class="card">
       <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
         <div>
-          <h2 style="font-size: 15px; font-weight: 600;">📋 Statusfenster: CSV-Einträge (Vorschau der neuesten Flüge)</h2>
-          <p style="font-size: 11px; color: var(--text-muted);">Nur Flüge mit erfasster Flugnummer werden dauerhaft in die CSV geschrieben.</p>
+          <h2 style="font-size: 15px; font-weight: 600;">📋 Statusfenster: CSV-Einträge (Geloggte Flüge)</h2>
+          <p style="font-size: 11px; color: var(--text-muted);">Alle Flüge mit Rufzeichen werden automatisch und dauerhaft in der CSV gespeichert.</p>
         </div>
         <div style="display: flex; gap: 10px;">
           <input type="text" id="search-input" placeholder="Suche nach Hex, Rufzeichen, Route..." oninput="filterTable()" style="width: 260px; font-size: 12px; padding: 6px 10px;">
@@ -1278,6 +1394,49 @@ class ADSBLogger:
 
   <script>
     let rawRows = [];
+
+    async function loadLiveAircraft() {
+      try {
+        const res = await fetch('/api/active');
+        const data = await res.json();
+        const list = data.aircraft || [];
+        const countBadge = document.getElementById('badge-live-count');
+        if (countBadge) countBadge.textContent = `${list.length} Flugzeug${list.length === 1 ? '' : 'e'}`;
+
+        const tbody = document.getElementById('live-tbody');
+        if (!list || list.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="10" style="text-align: center; color: var(--text-muted); padding: 18px;">Aktuell kein Flugzeug im 25 NM Radius erfasst.</td></tr>';
+          return;
+        }
+
+        tbody.innerHTML = list.map(ac => {
+          const hasCs = ac.callsign && ac.callsign !== '-';
+          const csHtml = hasCs 
+            ? `<strong style="color: #38bdf8;">${ac.callsign}</strong>` 
+            : `<span style="color: #64748b; font-style: italic;">Kein Rufzeichen</span>`;
+          const routeHtml = ac.route && ac.route !== '-' 
+            ? `<span style="color: #a7f3d0; font-weight: 600;">${ac.route}</span>` 
+            : (ac.airline && ac.airline !== '-' ? ac.airline : '-');
+          
+          return `
+            <tr>
+              <td>${csHtml}</td>
+              <td><code style="color: #fbbf24;">${ac.hex}</code></td>
+              <td>${routeHtml}</td>
+              <td>${ac.type_code !== '-' ? ac.type_code : ''} ${ac.registration !== '-' ? '(' + ac.registration + ')' : ''}</td>
+              <td><span style="color: #93c5fd;">${ac.altitude_ft !== '-' ? ac.altitude_ft + ' ft' : '-'}</span></td>
+              <td>${ac.speed_kts !== '-' ? ac.speed_kts + ' kts' : '-'}</td>
+              <td>${ac.track_deg !== '-' ? ac.track_deg + '°' : '-'}</td>
+              <td><span style="color: #34d399; font-weight: 600;">${ac.dst_nm !== '-' ? ac.dst_nm + ' NM' : '-'}</span></td>
+              <td><code>${ac.squawk}</code></td>
+              <td style="color: #94a3b8;">${ac.duration_s}s aktiv</td>
+            </tr>
+          `;
+        }).join('');
+      } catch (e) {
+        console.error("Live aircraft fetch error", e);
+      }
+    }
 
     function showAlert(msg, isSuccess = true) {
       const el = document.getElementById('alert-box');
@@ -1604,8 +1763,10 @@ class ADSBLogger:
     // Initial load & Polling
     updateHttpUrls();
     loadStatus();
+    loadLiveAircraft();
     loadPreview();
     setInterval(loadStatus, 3000);
+    setInterval(loadLiveAircraft, 2500);
     setInterval(loadPreview, 10000);
   </script>
 </body>
